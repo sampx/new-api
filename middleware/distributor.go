@@ -109,7 +109,7 @@ func Distribute() func(c *gin.Context) {
 						channelSupportsRequestPath(preferred, c.Request.URL.Path, modelRequest.Model) {
 						if usingGroup == "auto" {
 							userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-							autoGroups := service.GetUserAutoGroup(userGroup)
+							autoGroups := service.GetRequestAutoGroups(c, userGroup)
 							for _, g := range autoGroups {
 								if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
 									selectGroup = g
@@ -466,17 +466,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
+	
+	var excludeKeyIndexes map[int]bool
+	excludeKeys, _ := common.GetContextKey(c, constant.ContextKeyFailedChannelKeys)
+	if excludeKeys != nil {
+		if keysMap, ok := excludeKeys.(map[string]bool); ok {
+			excludeKeyIndexes = make(map[int]bool)
+			for k := range keysMap {
+				var cid, kid int
+				if _, err := fmt.Sscanf(k, "%d_%d", &cid, &kid); err == nil && cid == channel.Id {
+					excludeKeyIndexes[kid] = true
+				}
+			}
+		}
+	}
+	key, index, newAPIError := channel.GetNextEnabledKey(excludeKeyIndexes)
+
 	if newAPIError != nil {
 		return newAPIError
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
-		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	} else {
 		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
 	}
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())

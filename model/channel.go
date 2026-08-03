@@ -196,9 +196,12 @@ func (channel *Channel) GetKeys() []string {
 	return keys
 }
 
-func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+func (channel *Channel) GetNextEnabledKey(excludeKeyIndexes map[int]bool) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
+		if excludeKeyIndexes != nil && excludeKeyIndexes[0] {
+			return "", 0, types.NewError(errors.New("no enabled keys (excluded)"), types.ErrorCodeChannelNoAvailableKey)
+		}
 		return channel.Key, 0, nil
 	}
 
@@ -225,14 +228,17 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return common.ChannelStatusEnabled
 	}
 
-	// Collect indexes of enabled keys
+	// Collect indexes of enabled keys that are NOT excluded
 	enabledIdx := make([]int, 0, len(keys))
 	for i := range keys {
 		if getStatus(i) == common.ChannelStatusEnabled {
+			if excludeKeyIndexes != nil && excludeKeyIndexes[i] {
+				continue
+			}
 			enabledIdx = append(enabledIdx, i)
 		}
 	}
-	// If no specific status list or none enabled, return an explicit error so caller can
+	// If no specific status list or none enabled/eligible, return an explicit error so caller can
 	// properly handle a channel with no available keys (e.g. mark channel disabled).
 	// Returning the first key here caused requests to keep using an already-disabled key.
 	if len(enabledIdx) == 0 {
@@ -269,6 +275,9 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
 			if getStatus(idx) == common.ChannelStatusEnabled {
+				if excludeKeyIndexes != nil && excludeKeyIndexes[idx] {
+					continue
+				}
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil
@@ -280,6 +289,50 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		// Unknown mode, default to first enabled key (or original key string)
 		return keys[enabledIdx[0]], enabledIdx[0], nil
 	}
+}
+
+// GetEligibleKeys returns the indexes of keys that are enabled globally and NOT excluded by the current request.
+// If the channel is not multi-key, it treats index 0 as the only key.
+func (channel *Channel) GetEligibleKeys(excludeKeyIndexes map[int]bool) []int {
+	if !channel.ChannelInfo.IsMultiKey {
+		if excludeKeyIndexes != nil && excludeKeyIndexes[0] {
+			return []int{}
+		}
+		return []int{0}
+	}
+
+	keys := channel.GetKeys()
+	if len(keys) == 0 {
+		return []int{}
+	}
+
+	// We use the same getStatus logic, but since we are just reading the status list,
+	// and map reads in Go are not thread-safe if there are concurrent writes, we should lock.
+	lock := GetChannelPollingLock(channel.Id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	statusList := channel.ChannelInfo.MultiKeyStatusList
+	getStatus := func(idx int) int {
+		if statusList == nil {
+			return common.ChannelStatusEnabled
+		}
+		if status, ok := statusList[idx]; ok {
+			return status
+		}
+		return common.ChannelStatusEnabled
+	}
+
+	var eligible []int
+	for i := range keys {
+		if getStatus(i) == common.ChannelStatusEnabled {
+			if excludeKeyIndexes != nil && excludeKeyIndexes[i] {
+				continue
+			}
+			eligible = append(eligible, i)
+		}
+	}
+	return eligible
 }
 
 func (channel *Channel) SaveChannelInfo() error {

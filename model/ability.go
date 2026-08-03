@@ -1,6 +1,9 @@
 package model
 
 import (
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"math/rand"
+	"sort"
 	"errors"
 	"fmt"
 	"strings"
@@ -105,45 +108,100 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 	return channelQuery, nil
 }
 
-func GetChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+func GetChannel(group string, model string, requestPath string, excludeKeys map[string]bool) (*Channel, bool, error) {
+	// First fetch all enabled abilities for this group and model
 	var abilities []Ability
+	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).Find(&abilities).Error
+	if err != nil {
+		return nil, false, err
+	}
 
-	var err error = nil
-	channelQuery, err := getChannelQuery(group, model, retry)
-	if err != nil {
-		return nil, err
-	}
-	if common.UsingMainDatabase(common.DatabaseTypeSQLite) || common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
-	} else {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
-	}
-	if err != nil {
-		return nil, err
-	}
 	abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
-	channel := Channel{}
-	if len(abilities) > 0 {
-		// Randomly choose one
-		weightSum := uint(0)
-		for _, ability_ := range abilities {
-			weightSum += ability_.Weight + 10
-		}
-		// Randomly choose one
-		weight := common.GetRandomInt(int(weightSum))
-		for _, ability_ := range abilities {
-			weight -= int(ability_.Weight) + 10
-			//log.Printf("weight: %d, ability weight: %d", weight, *ability_.Weight)
-			if weight <= 0 {
-				channel.Id = ability_.ChannelId
-				break
+	if len(abilities) == 0 {
+		normalizedModel := ratio_setting.FormatMatchingModelName(model)
+		if normalizedModel != model {
+			err = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, normalizedModel, true).Find(&abilities).Error
+			if err == nil {
+				abilities = filterAbilitiesByRequestPathAndModel(abilities, requestPath, model)
 			}
 		}
-	} else {
-		return nil, nil
 	}
-	err = DB.First(&channel, "id = ?", channel.Id).Error
-	return &channel, err
+
+	if len(abilities) == 0 {
+		return nil, true, nil
+	}
+
+	// 1. Group available channels by Priority and filter by eligible keys
+	priorityToChannels := make(map[int][]*Channel)
+	for _, ability := range abilities {
+		channel, err := GetChannelById(ability.ChannelId, true)
+		if err != nil || channel == nil {
+			continue
+		}
+
+		var excludeIndexes map[int]bool
+		if excludeKeys != nil {
+			excludeIndexes = make(map[int]bool)
+			for k := range excludeKeys {
+				var cid, kid int
+				if _, err := fmt.Sscanf(k, "%d_%d", &cid, &kid); err == nil && cid == channel.Id {
+					excludeIndexes[kid] = true
+				}
+			}
+		}
+
+		eligibleKeys := channel.GetEligibleKeys(excludeIndexes)
+		if len(eligibleKeys) > 0 {
+			priority := int(channel.GetPriority())
+			priorityToChannels[priority] = append(priorityToChannels[priority], channel)
+		}
+	}
+
+	if len(priorityToChannels) == 0 {
+		return nil, true, errors.New("all channels and keys in this group have been exhausted")
+	}
+
+	// 2. Sort priorities descending
+	var sortedPriorities []int
+	for priority := range priorityToChannels {
+		sortedPriorities = append(sortedPriorities, priority)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(sortedPriorities)))
+
+	// 3. Pick the highest available priority
+	targetPriority := sortedPriorities[0]
+	targetChannels := priorityToChannels[targetPriority]
+
+	var sumWeight = 0
+	for _, channel := range targetChannels {
+		sumWeight += channel.GetWeight()
+	}
+
+	if len(targetChannels) == 0 {
+		return nil, true, fmt.Errorf("no channel found, group: %s, model: %s, priority: %d", group, model, targetPriority)
+	}
+
+	smoothingFactor := 1
+	smoothingAdjustment := 0
+
+	if sumWeight == 0 {
+		sumWeight = len(targetChannels) * 100
+		smoothingAdjustment = 100
+	} else if sumWeight/len(targetChannels) < 10 {
+		smoothingFactor = 100
+	}
+
+	totalWeight := sumWeight * smoothingFactor
+	randomWeight := rand.Intn(totalWeight)
+
+	for _, channel := range targetChannels {
+		randomWeight -= channel.GetWeight()*smoothingFactor + smoothingAdjustment
+		if randomWeight < 0 {
+			return channel, false, nil
+		}
+	}
+
+	return nil, true, errors.New("channel not found")
 }
 
 // filterAbilitiesByRequestPathAndModel restricts candidates by request path and
