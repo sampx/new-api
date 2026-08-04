@@ -38,6 +38,19 @@ func (token *Token) GetAutoGroups() ([]string, error) {
 	}
 	var groups []string
 	if err := common.UnmarshalJsonStr(token.AutoGroups, &groups); err != nil {
+		raw := strings.TrimSpace(token.AutoGroups)
+		if !strings.HasPrefix(raw, "[") {
+			var result []string
+			for _, item := range strings.Split(raw, ",") {
+				trimmed := strings.TrimSpace(strings.Trim(item, "\""))
+				if trimmed != "" {
+					result = append(result, trimmed)
+				}
+			}
+			if len(result) > 0 {
+				return result, nil
+			}
+		}
 		return nil, err
 	}
 	return groups, nil

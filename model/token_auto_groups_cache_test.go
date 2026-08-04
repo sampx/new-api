@@ -55,3 +55,37 @@ func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `["vip"]`, immediate.AutoGroups)
 }
+
+func TestTokenGetAutoGroupsFallbackForNonJsonStrings(t *testing.T) {
+	tests := []struct {
+		name       string
+		autoGroups string
+		expected   []string
+	}{
+		{
+			name:       "raw single group",
+			autoGroups: "default",
+			expected:   []string{"default"},
+		},
+		{
+			name:       "raw single group with quotes",
+			autoGroups: `"default"`,
+			expected:   []string{"default"},
+		},
+		{
+			name:       "comma separated groups",
+			autoGroups: "vip, default",
+			expected:   []string{"vip", "default"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			token := Token{AutoGroups: tt.autoGroups}
+			groups, err := token.GetAutoGroups()
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, groups)
+		})
+	}
+}
+
