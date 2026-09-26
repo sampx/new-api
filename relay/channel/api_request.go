@@ -22,6 +22,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -144,8 +145,94 @@ func shouldSkipPassthroughHeader(name string) bool {
 	return false
 }
 
+// resolveSingleCandidate resolves a single placeholder candidate to a concrete value.
+// Returns (value, true) on success, or ("", false) if the candidate yields no value.
+func resolveSingleCandidate(candidate string, c *gin.Context, apiKey string) (string, bool) {
+	expr := strings.TrimSpace(candidate)
+	if expr == "" {
+		return "", false
+	}
+
+	// {uuid}, {random_uuid}, crypto.randomUUID(), {crypto.randomUUID()}
+	lower := strings.ToLower(expr)
+	if lower == "{uuid}" || lower == "{random_uuid}" || lower == "crypto.randomuuid()" || lower == "{crypto.randomuuid()}" {
+		return uuid.New().String(), true
+	}
+
+	// {client_header:NAME}
+	if strings.HasPrefix(expr, clientHeaderPlaceholderPrefix) && strings.HasSuffix(expr, "}") {
+		name := strings.TrimSpace(expr[len(clientHeaderPlaceholderPrefix) : len(expr)-1])
+		if name == "" {
+			return "", false
+		}
+		if c == nil || c.Request == nil {
+			return "", false
+		}
+		val := strings.TrimSpace(c.Request.Header.Get(name))
+		if val != "" {
+			return val, true
+		}
+		return "", false
+	}
+
+	// {api_key}
+	if strings.Contains(expr, "{api_key}") {
+		val := strings.TrimSpace(strings.ReplaceAll(expr, "{api_key}", apiKey))
+		if val != "" {
+			return val, true
+		}
+		return "", false
+	}
+
+	// Static literal fallback (strip surrounding quotes if present).
+	literal := strings.Trim(expr, "\"'")
+	if literal != "" {
+		return literal, true
+	}
+	return "", false
+}
+
+// coalesceOperator is the separator for fallback chains in header override values.
+const coalesceOperator = "||"
+
 func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey string) (string, bool, error) {
 	trimmed := strings.TrimSpace(template)
+	if trimmed == "" {
+		return "", false, nil
+	}
+
+	// Detect coalesce chains: either "A || B || C" or "{A || B || C}" (single-brace wrapped).
+	// Only unwrap when the opening "{" and closing "}" truly form a single pair —
+	// i.e. there are no other "}" between the first "{" and the final "}".
+	evalTarget := trimmed
+	if strings.HasPrefix(evalTarget, "{") && strings.HasSuffix(evalTarget, "}") {
+		inner := strings.TrimSpace(evalTarget[1 : len(evalTarget)-1])
+		if strings.Contains(inner, coalesceOperator) && !strings.Contains(inner, "}") {
+			evalTarget = inner
+		}
+	}
+
+	if strings.Contains(evalTarget, coalesceOperator) {
+		candidates := strings.Split(evalTarget, coalesceOperator)
+		for _, raw := range candidates {
+			cand := strings.TrimSpace(raw)
+			if cand == "" {
+				continue
+			}
+			// Auto-wrap bare "client_header:NAME" into "{client_header:NAME}".
+			if strings.HasPrefix(cand, "client_header:") && !strings.HasPrefix(cand, "{") {
+				cand = "{" + cand + "}"
+			}
+			val, ok := resolveSingleCandidate(cand, c, apiKey)
+			if ok && val != "" {
+				return val, true, nil
+			}
+		}
+		return "", false, nil
+	}
+
+	// --- Single candidate (backward-compatible with original logic) ---
+	// {client_header:NAME} – strict single-placeholder path.
 	if strings.HasPrefix(trimmed, clientHeaderPlaceholderPrefix) {
 		afterPrefix := trimmed[len(clientHeaderPlaceholderPrefix):]
 		end := strings.Index(afterPrefix, "}")
@@ -270,7 +357,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		if !ok {
 			return nil, types.NewError(nil, types.ErrorCodeChannelHeaderOverrideInvalid)
 		}
-		if info.IsChannelTest && strings.HasPrefix(strings.TrimSpace(str), clientHeaderPlaceholderPrefix) {
+		if info.IsChannelTest && strings.HasPrefix(strings.TrimSpace(str), clientHeaderPlaceholderPrefix) && !strings.Contains(str, coalesceOperator) {
 			continue
 		}
 

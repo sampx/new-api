@@ -191,3 +191,135 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 	require.Equal(t, "sess-123", upstreamReq.Header.Get("Session_id"))
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
 }
+
+// --- Coalesce (||) fallback tests ---
+
+func TestApplyHeaderOverridePlaceholders_CoalesceFirstHit(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("X-Session-Affinity", "sess-abc")
+
+	val, ok, err := applyHeaderOverridePlaceholders(
+		"{client_header:x-opencode-session} || {client_header:x-session-affinity} || {uuid}",
+		ctx, "sk-test",
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "sess-abc", val)
+}
+
+func TestApplyHeaderOverridePlaceholders_CoalesceFallsToUUID(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	// No session headers set at all.
+
+	val, ok, err := applyHeaderOverridePlaceholders(
+		"{client_header:x-opencode-session} || {client_header:x-session-affinity} || {uuid}",
+		ctx, "sk-test",
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, val, 36) // UUID v4 format: 8-4-4-4-12 = 36 chars
+	require.Contains(t, val, "-")
+}
+
+func TestApplyHeaderOverridePlaceholders_CoalesceBareClientHeader(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("X-Session-Id", "my-sess-id")
+
+	// Bare "client_header:X-Session-Id" without wrapping braces.
+	val, ok, err := applyHeaderOverridePlaceholders(
+		"client_header:x-opencode-session || client_header:X-Session-Id || {uuid}",
+		ctx, "sk-test",
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "my-sess-id", val)
+}
+
+func TestApplyHeaderOverridePlaceholders_CoalesceWrappedSyntax(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	// Wrapped "{A || B}" syntax with no matching headers; should fall to uuid.
+	val, ok, err := applyHeaderOverridePlaceholders(
+		"{client_header:x-opencode-session || client_header:x-session-affinity || crypto.randomUUID()}",
+		ctx, "sk-test",
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, val, 36)
+}
+
+func TestApplyHeaderOverridePlaceholders_CoalesceStaticLiteral(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	val, ok, err := applyHeaderOverridePlaceholders(
+		`{client_header:x-missing} || "default-session"`,
+		ctx, "sk-test",
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "default-session", val)
+}
+
+func TestApplyHeaderOverridePlaceholders_SingleClientHeaderBackwardCompat(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("X-Trace-Id", "trace-999")
+
+	// Original single-placeholder usage must still work identically.
+	val, ok, err := applyHeaderOverridePlaceholders("{client_header:X-Trace-Id}", ctx, "sk-test")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "trace-999", val)
+}
+
+func TestApplyHeaderOverridePlaceholders_SingleClientHeaderMissingBackwardCompat(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	// Missing header with single placeholder should return false, no error.
+	val, ok, err := applyHeaderOverridePlaceholders("{client_header:X-Missing}", ctx, "sk-test")
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Empty(t, val)
+}
+
+func TestProcessHeaderOverride_ChannelTestCoalesceFallsToUUID(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	info := &relaycommon.RelayInfo{
+		IsChannelTest: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			HeadersOverride: map[string]any{
+				"X-Opencode-Session": "{client_header:x-opencode-session} || {client_header:x-session-affinity} || {uuid}",
+			},
+		},
+	}
+
+	headers, err := processHeaderOverride(info, ctx)
+	require.NoError(t, err)
+	val, ok := headers["x-opencode-session"]
+	require.True(t, ok, "coalesce template with {uuid} fallback should produce a value during channel test")
+	require.Len(t, val, 36)
+}
