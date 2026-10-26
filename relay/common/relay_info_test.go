@@ -1,10 +1,14 @@
 package common
 
 import (
+	"net/http/httptest"
 	"testing"
 
+	common2 "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -77,4 +81,30 @@ func TestRelayInfoMetaTypedNilReceiver(t *testing.T) {
 	assert.NotNil(t, firstOptions.Gemini.SupportsImagine)
 	assert.NotNil(t, firstOptions.Gemini.SafetySetting)
 	assert.NotNil(t, firstOptions.PreserveThinkingSuffix)
+}
+
+func TestInitChannelMetaDropsPreviousChannelRuntimeHeaderOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	// Attempt 1 (channel with param override but no header override) froze an empty
+	// runtime snapshot; a cross-channel retry must not keep using it.
+	info := &RelayInfo{
+		UseRuntimeHeadersOverride: true,
+		RuntimeHeadersOverride:    map[string]interface{}{},
+	}
+
+	// Attempt 2: the retried channel defines its own header override template.
+	common2.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common2.SetContextKey(c, constant.ContextKeyChannelId, 9)
+	common2.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, map[string]interface{}{
+		"x-opencode-session": "{client_header:x-session-affinity} || {uuid}",
+	})
+
+	info.InitChannelMeta(c)
+
+	override := GetEffectiveHeaderOverride(info)
+	require.Equal(t, "{client_header:x-session-affinity} || {uuid}", override["x-opencode-session"])
+	require.False(t, info.UseRuntimeHeadersOverride)
+	require.Nil(t, info.RuntimeHeadersOverride)
 }

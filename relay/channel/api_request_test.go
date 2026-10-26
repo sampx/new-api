@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -322,4 +324,42 @@ func TestProcessHeaderOverride_ChannelTestCoalesceFallsToUUID(t *testing.T) {
 	val, ok := headers["x-opencode-session"]
 	require.True(t, ok, "coalesce template with {uuid} fallback should produce a value during channel test")
 	require.Len(t, val, 36)
+}
+
+func TestProcessHeaderOverride_CrossChannelRetryKeepsRetriedChannelOverride(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("X-Session-Affinity", "sess-retry-1")
+
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ParamOverride: map[string]any{
+				"operations": []any{
+					map[string]any{"mode": "set", "path": "reasoning_effort", "value": "xhigh"},
+				},
+			},
+		},
+	}
+
+	// Attempt 1: the previous channel has a param override but no header override, so
+	// applying it freezes an empty runtime header snapshot.
+	_, err := relaycommon.ApplyParamOverrideWithRelayInfo([]byte(`{"model":"deepseek-v4.1-flash"}`), info)
+	require.NoError(t, err)
+	require.True(t, info.UseRuntimeHeadersOverride)
+
+	// Attempt 2: the retry lands on a channel with its own dynamic header override.
+	common.SetContextKey(ctx, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(ctx, constant.ContextKeyChannelId, 9)
+	common.SetContextKey(ctx, constant.ContextKeyChannelHeaderOverride, map[string]any{
+		"x-opencode-session": "{client_header:x-session-affinity} || {uuid}",
+	})
+	info.InitChannelMeta(ctx)
+
+	headers, err := processHeaderOverride(info, ctx)
+	require.NoError(t, err)
+	require.Equal(t, "sess-retry-1", headers["x-opencode-session"])
 }

@@ -242,6 +242,12 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	// OpenRouterDialect); drop the cache so a cross-channel retry rebuilds it.
 	info.convOptions = nil
 
+	// The runtime header override is derived from the previous attempt's param
+	// override. Keeping it here would hide this channel's own header override on a
+	// cross-channel retry, so reset it and let the current attempt re-derive it.
+	info.RuntimeHeadersOverride = nil
+	info.UseRuntimeHeadersOverride = false
+
 	// reset some fields based on channel meta
 	// 重置某些字段，例如模型名称等
 	if info.Request != nil {
