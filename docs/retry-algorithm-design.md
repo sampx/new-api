@@ -23,7 +23,10 @@
 - **穷尽同级资源**：如果 Priority 8 中有 3 个 Key（无论是在 1 个多 Key 渠道里，还是拆分成 3 个单 Key 渠道），当出现 429 时，剩余的重试次数应优先消耗在这剩下的 2 个未尝试的 Key/渠道上。
 - **平滑降级**：只有当 Priority 8 的所有候选者都被本次请求证实不可用（均在本次黑名单中），才去获取 Priority 7 的渠道。
 - **尊重重试预算**：每次真实失败后继续排除当前 channel/key，并在 `RetryTimes` 配置的剩余预算内按既有优先级与权重选择下一个候选；候选先耗尽则提前停止，重试预算先耗尽也停止。未命中自动重试状态码规则的错误立即停止。
-- **保留真实失败原因**：如果已经实际请求过 upstream，之后因本请求的排除集合导致候选耗尽，最终客户端错误保留最后一个真实 upstream error；如果首次选路就没有候选、从未请求 upstream，则仍返回原有的渠道选择失败错误。
+- **保留真实失败原因**：如果一次客户端请求已经经历 upstream 失败并进入重试，最终仍失败时，客户端返回本次重试链的精简 upstream 错误摘要，而不是只看到最后一个错误或 generic exhaustion；如果首次选路就没有候选、从未请求 upstream，则仍返回原有的渠道选择失败错误。
+- **限制客户端错误长度**：重试失败摘要连同 request id 的客户端 `error.message` 最多 400 个 Unicode 字符。优先保留 channel id、HTTP status 和每个渠道的错误原因；空间不足时先去掉渠道名称，再截断各渠道错误文本，最后仍受 400 字符硬上限约束。
+- **成功不泄露失败历史**：只要任一后续渠道成功，客户端只收到正常成功响应，不携带此前渠道的失败历史。
+- **日志保留完整重试链**：服务端按 attempt 记录 channel id/name、multi-key index、status、error 以及 retry/stop/success 动作；客户端的 400 字符限制不用于服务端重试日志。
 - **保护全局状态**：不使用持久化的 AutoBan 来处理 429，只在当前 `gin.Context` 级别维护一个“本请求生命周期内的黑名单”（排斥名单）。
 - **完全兼容现有计费**：不修改任何计费逻辑（保持 `preConsume` / `Settle` 安全），不改变 GORM 数据库结构。
 
@@ -62,6 +65,14 @@ targetPriority := sortedUniquePriorities[retry] // 直接按 retry 取对应的 
    - 对这个最高 Priority 的 `targetChannels` 执行现有的按 `weight` (权重) 随机抽取的逻辑。
 4. **同级耗尽则自然降级**：
    - 由于黑名单是累加的，如果某个 Priority 下的渠道组合被试光了，那下一次进函数时，过滤后剩下的最高 Priority 自然就变成了更低一级的 Priority。这就完美实现了同级耗尽后再降级的需求。
+
+### 3.3 终态错误摘要与 retry trace (`controller/relay.go`)
+
+- 每次选定渠道后，如果 relay 返回错误，记录该 attempt 的 channel id/name、multi-key index、HTTP status 与脱敏错误文本；该记录只存在于当前请求生命周期。
+- `shouldRetry`、`RetryTimes`、自动重试状态码、优先级、权重、多 Key 与 auto-group 的判断顺序保持不变；错误历史仅用于终态展示与日志，不参与选路。
+- 如果最终错误仍是重试链中的最后一个 upstream error，并且确实发生过至少一次 retry，则客户端将本次失败历史压缩成单行摘要：`#<channel>/<status>:<error>; ...`。短摘要可带渠道名称；超长时先去掉渠道名，再平均压缩各渠道错误文本。
+- 客户端摘要与 request id 合计最多 400 个 Unicode 字符；超过时硬截断。网关自身的 `candidates_exhausted` / retry budget 等停止原因只写服务端日志，不占客户端摘要空间。
+- 如果重试后成功，历史错误只留在服务端日志；如果后续发生的是本地读取/计费/选路等非 upstream 终态错误，则不使用历史 upstream 摘要覆盖该新错误。
 
 ### 4. 影响范围与安全评估
 

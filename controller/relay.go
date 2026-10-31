@@ -68,6 +68,125 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 	return err
 }
 
+const maxRelayRetryClientMessageRunes = 400
+
+type relayAttemptError struct {
+	ChannelID   int
+	ChannelName string
+	StatusCode  int
+	Message     string
+	apiError    *types.NewAPIError
+}
+
+func relayRetryClientMessage(attempts []relayAttemptError, requestId string) string {
+	if len(attempts) == 0 {
+		return ""
+	}
+
+	requestIdSuffix := fmt.Sprintf(" (request id: %s)", requestId)
+	suffixRunes := len([]rune(requestIdSuffix))
+	if suffixRunes >= maxRelayRetryClientMessageRunes {
+		return truncateRelayRetryText(requestIdSuffix, maxRelayRetryClientMessageRunes)
+	}
+
+	summary := formatRelayRetrySummary(attempts, maxRelayRetryClientMessageRunes-suffixRunes)
+	return summary + requestIdSuffix
+}
+
+func formatRelayRetrySummary(attempts []relayAttemptError, maxRunes int) string {
+	if len(attempts) == 0 || maxRunes <= 0 {
+		return ""
+	}
+
+	fullEntries := make([]string, 0, len(attempts))
+	compactEntries := make([]string, 0, len(attempts))
+	labels := make([]string, 0, len(attempts))
+	messages := make([]string, 0, len(attempts))
+	for _, attempt := range attempts {
+		status := "ERR"
+		if attempt.StatusCode > 0 {
+			status = fmt.Sprintf("%d", attempt.StatusCode)
+		}
+		label := fmt.Sprintf("#%d/%s", attempt.ChannelID, status)
+		message := compactRelayRetryText(attempt.Message)
+
+		fullLabel := label
+		if name := compactRelayRetryText(attempt.ChannelName); name != "" {
+			fullLabel = fmt.Sprintf("#%d %s/%s", attempt.ChannelID, name, status)
+		}
+		fullEntry := fullLabel
+		compactEntry := label
+		if message != "" {
+			fullEntry += ":" + message
+			compactEntry += ":" + message
+		}
+
+		fullEntries = append(fullEntries, fullEntry)
+		compactEntries = append(compactEntries, compactEntry)
+		labels = append(labels, label)
+		messages = append(messages, message)
+	}
+
+	fullSummary := strings.Join(fullEntries, "; ")
+	if len([]rune(fullSummary)) <= maxRunes {
+		return fullSummary
+	}
+
+	compactSummary := strings.Join(compactEntries, "; ")
+	if len([]rune(compactSummary)) <= maxRunes {
+		return compactSummary
+	}
+
+	baseRunes := 2 * (len(labels) - 1)
+	for _, label := range labels {
+		baseRunes += len([]rune(label))
+	}
+	if baseRunes >= maxRunes {
+		return truncateRelayRetryText(strings.Join(labels, "; "), maxRunes)
+	}
+
+	messageBudget := maxRunes - baseRunes - len(labels)
+	if messageBudget < 0 {
+		messageBudget = 0
+	}
+	perMessageRunes := 0
+	if len(messages) > 0 {
+		perMessageRunes = messageBudget / len(messages)
+	}
+
+	entries := make([]string, 0, len(labels))
+	for i, label := range labels {
+		entry := label
+		if perMessageRunes > 0 && messages[i] != "" {
+			entry += ":" + truncateRelayRetryText(messages[i], perMessageRunes)
+		}
+		entries = append(entries, entry)
+	}
+	return truncateRelayRetryText(strings.Join(entries, "; "), maxRunes)
+}
+
+func compactRelayRetryText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func truncateRelayRetryText(text string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	if maxRunes == 1 {
+		return "…"
+	}
+	return string(runes[:maxRunes-1]) + "…"
+}
+
+func shouldReturnRelayRetrySummary(attempts []relayAttemptError, retryIndex int, finalErr *types.NewAPIError) bool {
+	return len(attempts) > 0 && retryIndex > 0 && finalErr != nil && finalErr == attempts[len(attempts)-1].apiError
+}
+
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	requestId := c.GetString(common.RequestIdKey)
@@ -75,8 +194,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 
 	var (
-		newAPIError *types.NewAPIError
-		ws          *websocket.Conn
+		newAPIError             *types.NewAPIError
+		ws                      *websocket.Conn
+		retryAttemptErrors      []relayAttemptError
+		returnRetryErrorSummary bool
 	)
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
@@ -92,6 +213,29 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			if returnRetryErrorSummary && len(retryAttemptErrors) > 0 {
+				clientMessage := relayRetryClientMessage(retryAttemptErrors, requestId)
+				switch relayFormat {
+				case types.RelayFormatOpenAIRealtime:
+					openAIError := newAPIError.ToOpenAIError()
+					openAIError.Message = clientMessage
+					helper.WssError(c, ws, openAIError)
+				case types.RelayFormatClaude:
+					claudeError := newAPIError.ToClaudeError()
+					claudeError.Message = clientMessage
+					c.JSON(newAPIError.StatusCode, gin.H{
+						"type":  "error",
+						"error": claudeError,
+					})
+				default:
+					openAIError := newAPIError.ToOpenAIError()
+					openAIError.Message = clientMessage
+					c.JSON(newAPIError.StatusCode, gin.H{
+						"error": openAIError,
+					})
+				}
+				return
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -200,6 +344,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = finalRelayErrorAfterSelectionFailure(channelErr, relayInfo, retryParam)
+			if newAPIError == relayInfo.LastError && len(retryAttemptErrors) > 0 && retryParam.SelectionExhausted {
+				logger.LogInfo(c, fmt.Sprintf("relay retry trace: action=stop reason=candidates_exhausted failures=%d", len(retryAttemptErrors)))
+			}
 			break
 		}
 		addUsedChannel(c, channel.Id)
@@ -232,6 +379,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
+			if len(retryAttemptErrors) > 0 {
+				logger.LogInfo(c, fmt.Sprintf(
+					"relay retry trace: attempt=%d channel=#%d name=%q key_index=%d action=success previous_failures=%d",
+					retryParam.GetRetry()+1,
+					channel.Id,
+					channel.Name,
+					common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
+					len(retryAttemptErrors),
+				))
+			}
 			relayInfo.LastError = nil
 			return
 		}
@@ -241,13 +398,37 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
-		if shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
-			keyIndex := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
+		keyIndex := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
+		shouldRetryError := shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
+		retryAttemptErrors = append(retryAttemptErrors, relayAttemptError{
+			ChannelID:   channel.Id,
+			ChannelName: channel.Name,
+			StatusCode:  newAPIError.StatusCode,
+			Message:     newAPIError.MaskSensitiveError(),
+			apiError:    newAPIError,
+		})
+		action := "stop"
+		if shouldRetryError && retryParam.GetRetry() < common.RetryTimes {
+			action = "retry"
+		}
+		logger.LogInfo(c, fmt.Sprintf(
+			"relay retry trace: attempt=%d channel=#%d name=%q key_index=%d status=%d action=%s error=%q",
+			retryParam.GetRetry()+1,
+			channel.Id,
+			channel.Name,
+			keyIndex,
+			newAPIError.StatusCode,
+			action,
+			common.LocalLogPreview(newAPIError.MaskSensitiveError()),
+		))
+
+		if shouldRetryError {
 			retryParam.AddExcludeKey(channel.Id, keyIndex)
 		} else {
 			break
 		}
 	}
+	returnRetryErrorSummary = shouldReturnRelayRetrySummary(retryAttemptErrors, retryParam.GetRetry(), newAPIError)
 
 	useChannel := c.GetStringSlice("use_channel")
 	if len(useChannel) > 1 {
