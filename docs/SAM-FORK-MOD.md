@@ -40,18 +40,19 @@
 
 5. **每个新增 Sam 定制提交都要同步更新本文档。**
    - 记录提交哈希、背景、主要行为、涉及模块及是否仍需长期保留。
+   - 仅用于维护本清单本身的 docs-only 记录提交不单独编号，避免清单产生自引用递归；其所记录的业务/治理提交仍必须逐项列出。
 
 ### 当前分支状态（2026-10-31）
 
 - `main`：`c27d1ef65`，与 `origin/main` 对齐。
-- `sam-dev`：`48252b208`，包含当前全部 5 个 Sam 定制提交，并跟踪 `origin/sam-dev`。
+- `sam-dev`：截至本次业务修复提交 `247c8a27a`，包含当前全部 7 个需在未来上游升级时审计的 Sam 定制/治理提交，并跟踪 `origin/sam-dev`；其后的纯清单维护提交不单独作为定制编号。
 - 官方 `upstream/main` 已明显领先当前 Fork 基线，但本阶段只做参考，不合并。
 
 ---
 
 ## 2. 当前 Sam 定制提交总览
 
-当前 `sam-dev` 相对 `origin/main` 包含以下 5 个定制提交：
+截至业务修复提交 `247c8a27a`，`sam-dev` 相对 `origin/main` 包含以下 7 个需要在未来上游升级时识别的定制/治理提交：
 
 | 编号 | 变更主题 | 提交哈希 | 涉及模块 | 主要功能 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -60,6 +61,8 @@
 | **03** | Auto-groups 防御性容错解析 | `4765a4d7e` | `model` | 非 JSON 历史值容错，避免解析异常 |
 | **04** | Header Override 支持 `||` 回退与动态 UUID | `4c21df678` | `relay/channel` | 多级客户端 Header 回退、`{uuid}` 生成、渠道测试兼容 |
 | **05** | 渠道切换时重置运行时 Header Override | `48252b208` | `relay/channel` | 避免重试/切换渠道后沿用前一个渠道的运行时 Header 覆盖状态 |
+| **06** | `sam-dev` 分支与生产部署治理规则 | `3cf6eeb85` | `docs` | 明确 `main` / `sam-dev` / `upstream/main` 职责、生产构建来源与受控上游升级流程 |
+| **07** | Retry exhaustion 错误保真 | `247c8a27a` | `controller`, `service`, `docs` | 保留 `RetryTimes` 与既有选路机制；候选耗尽时向客户端返回最后真实 upstream error，而不是 generic `get_channel_failed` |
 
 ---
 
@@ -130,6 +133,37 @@
   - 在 channel 切换时重置 runtime header override；
   - 确保每个新 channel 都基于自身配置重新计算 Header 覆盖；
   - 避免多渠道重试链出现跨渠道 Header 污染。
+
+---
+
+### 06. `sam-dev` 分支与生产部署治理规则 (`3cf6eeb85`)
+
+- **背景与目的**：
+  - 将官方 Fork 基线与 Sam 长期定制开发明确分离；
+  - 避免 Sam 私有修复继续直接堆叠在 `main`；
+  - 为未来受控升级 `upstream/main` 保留可审计边界。
+- **主要规则**：
+  1. `main` 仅作为跟踪 `origin/main` 的干净 Fork 基线；
+  2. `sam-dev` 是 Sam 定制开发、构建与生产部署的唯一长期分支；
+  3. 上游升级必须作为独立任务执行，不在普通 Bug 修复中顺手 merge/rebase/cherry-pick。
+
+---
+
+### 07. Retry exhaustion 错误保真 (`247c8a27a`)
+
+- **相关设计文档**：[`docs/retry-algorithm-design.md`](retry-algorithm-design.md)
+- **背景与问题**：
+  - 某次 upstream 请求已经返回真实错误并命中自动重试规则后，当前请求会把失败的 channel/key 加入排除集并继续选路；
+  - 如果候选在 `RetryTimes` 预算耗尽前先被排空，下一次选路会返回 generic `get_channel_failed`，从而覆盖此前最后一个真实 upstream error；
+  - `RetryTimes` 本身是有效配置，必须继续作为普通 Relay 的最大重试预算，不能被绕过。
+- **主要实现**：
+  1. 保持 `RetryTimes`、自动重试状态码、优先级、权重、多 Key 与 auto-group 的原有重试/选路机制不变；
+  2. selector 仅向 controller 暴露“本次选择已确认候选耗尽”的状态，不改变候选排序或选择结果；
+  3. 若已有真实 upstream error 且随后确认候选耗尽，则最终客户端错误恢复为 `relayInfo.LastError`；
+  4. 初始就无可用渠道、尚未请求 upstream 时，继续返回原有渠道选择失败错误；非 exhaustion 的新选路错误也不会被旧 upstream error 覆盖。
+- **维护注意**：
+  - 例如 `RetryTimes=8` 时，初次请求之后最多再重试 8 次；候选先耗尽则提前停止，预算先耗尽也停止；
+  - 不要为了错误保真修改现有 channel/key 选择顺序或自动重试状态码策略。
 
 ---
 
