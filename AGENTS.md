@@ -140,6 +140,14 @@ Do NOT directly import or call `encoding/json` in business code. `json.RawMessag
 
 ### Project Governance
 
+**SAM fork branch and deployment policy:** Before modifying, building, deploying, or synchronizing this fork, MUST read [`docs/SAM-FORK-MOD.md`](docs/SAM-FORK-MOD.md).
+
+- `main` is the clean fork baseline that tracks `origin/main`; Sam-specific changes MUST NOT be developed or accumulated on `main`.
+- `sam-dev` is the canonical long-lived branch for all Sam-specific code changes, bug fixes, compatibility work, deployment scripts, and production builds.
+- Sam's self-built Docker images and production deployments MUST be built from `sam-dev`, not `main`.
+- Fetching `upstream/main` for inspection is allowed, but merging, rebasing, or cherry-picking upstream changes into `sam-dev` requires a dedicated upstream-upgrade task. Do not perform opportunistic upstream upgrades while fixing Sam-specific bugs.
+- Every new Sam-specific commit MUST be recorded in `docs/SAM-FORK-MOD.md` so future upstream upgrades can classify it as retained, replaced by upstream, or needing rewrite.
+
 **Protected project information:** The following project-related information is strictly protected and MUST NOT be modified, deleted, replaced, or removed under any circumstances:
 
 - Any references, mentions, branding, metadata, or attributions related to **nеw-аρi** (the project name/identity)
