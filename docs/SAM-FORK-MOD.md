@@ -45,14 +45,14 @@
 ### 当前分支状态（2026-10-31）
 
 - `main`：`c27d1ef65`，与 `origin/main` 对齐。
-- `sam-dev`：截至本次业务修复提交 `247c8a27a`，包含当前全部 7 个需在未来上游升级时审计的 Sam 定制/治理提交，并跟踪 `origin/sam-dev`；其后的纯清单维护提交不单独作为定制编号。
+- `sam-dev`：截至本次业务修复提交 `d18e0d500`，包含当前全部 8 个需在未来上游升级时审计的 Sam 定制/治理提交，并跟踪 `origin/sam-dev`；其后的纯清单维护提交不单独作为定制编号。
 - 官方 `upstream/main` 已明显领先当前 Fork 基线，但本阶段只做参考，不合并。
 
 ---
 
 ## 2. 当前 Sam 定制提交总览
 
-截至业务修复提交 `247c8a27a`，`sam-dev` 相对 `origin/main` 包含以下 7 个需要在未来上游升级时识别的定制/治理提交：
+截至业务修复提交 `d18e0d500`，`sam-dev` 相对 `origin/main` 包含以下 8 个需要在未来上游升级时识别的定制/治理提交：
 
 | 编号 | 变更主题 | 提交哈希 | 涉及模块 | 主要功能 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -63,6 +63,7 @@
 | **05** | 渠道切换时重置运行时 Header Override | `48252b208` | `relay/channel` | 避免重试/切换渠道后沿用前一个渠道的运行时 Header 覆盖状态 |
 | **06** | `sam-dev` 分支与生产部署治理规则 | `3cf6eeb85` | `docs` | 明确 `main` / `sam-dev` / `upstream/main` 职责、生产构建来源与受控上游升级流程 |
 | **07** | Retry exhaustion 错误保真 | `247c8a27a` | `controller`, `service`, `docs` | 保留 `RetryTimes` 与既有选路机制；候选耗尽时向客户端返回最后真实 upstream error，而不是 generic `get_channel_failed` |
+| **08** | 终态 retry 错误汇总与日志追踪 | `d18e0d500` | `controller`, `docs` | 最终重试失败时汇总各渠道 upstream 错误，客户端消息硬限制 400 Unicode 字符；成功响应不携带历史错误，服务端记录清晰 retry trace |
 
 ---
 
@@ -164,6 +165,27 @@
 - **维护注意**：
   - 例如 `RetryTimes=8` 时，初次请求之后最多再重试 8 次；候选先耗尽则提前停止，预算先耗尽也停止；
   - 不要为了错误保真修改现有 channel/key 选择顺序或自动重试状态码策略。
+
+---
+
+### 08. 终态 retry 错误汇总与日志追踪 (`d18e0d500`)
+
+- **相关设计文档**：[`docs/retry-algorithm-design.md`](retry-algorithm-design.md)
+- **背景与需求**：
+  - 仅返回最后一个 upstream error 仍然不足以判断一次客户端请求到底尝试过哪些渠道、各渠道分别为什么失败；
+  - 但把完整 provider 错误链原样返回会撑爆客户端错误展示，因此必须限制客户端错误长度；
+  - 成功重试不应把前序失败历史泄露到正常响应中，而服务端日志仍应保留完整重试轨迹。
+- **主要实现**：
+  1. 保持 `RetryTimes`、自动重试状态码、优先级、权重、多 Key 与 auto-group 的现有重试/选路行为不变；
+  2. 每次渠道 relay 失败后记录 channel id/name、key index、HTTP status 与脱敏错误文本，仅用于当前请求的终态展示与日志；
+  3. 若请求确实发生过 retry 且最终仍以重试链中的 upstream error 结束，则客户端返回按尝试顺序汇总的简短错误摘要；
+  4. 客户端摘要连同 request id 最多 400 个 Unicode 字符：空间不足时先去掉渠道名称，再压缩各渠道错误文本，最终仍受 400 字符硬上限；
+  5. 如果后续渠道成功，客户端只返回正常成功响应，不包含历史错误；如果后续终态变成新的本地/选路错误，也不让旧 upstream 历史覆盖该错误；
+  6. 服务端增加 `relay retry trace`，记录 attempt、channel、key index、status、error 与 retry/stop/success 动作；客户端长度限制不影响日志完整性。
+- **维护注意**：
+  - 客户端错误摘要只用于最终失败的 retry 链，不要扩展成成功响应 metadata；
+  - channel id 与 status 是摘要的优先保留字段，错误文本必须先脱敏再进入客户端；
+  - 不要为了汇总错误历史改变现有 retry 决策或 selector 顺序。
 
 ---
 
