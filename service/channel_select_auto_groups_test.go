@@ -109,6 +109,7 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 		ModelName:   modelName,
 		RequestPath: "/v1/chat/completions",
 		Retry:       &retry,
+		ExcludeKeys: make(map[string]bool),
 	}
 
 	first, selectedGroup, err := CacheGetRandomSatisfiedChannel(param)
@@ -119,6 +120,7 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 	assert.Equal(t, "vip", common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
 	assert.Empty(t, setting.GetAutoGroups(), "the selection must not depend on the global Auto list")
 
+	param.AddExcludeKey(first.Id, 0)
 	param.IncreaseRetry()
 	second, selectedGroup, err := CacheGetRandomSatisfiedChannel(param)
 	require.NoError(t, err)
@@ -126,4 +128,12 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 	assert.Equal(t, 2102, second.Id)
 	assert.Equal(t, "default", selectedGroup)
 	assert.Equal(t, "default", common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
+	assert.False(t, param.SelectionExhausted)
+
+	param.AddExcludeKey(second.Id, 0)
+	param.IncreaseRetry()
+	third, _, err := CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	assert.Nil(t, third)
+	assert.True(t, param.SelectionExhausted)
 }

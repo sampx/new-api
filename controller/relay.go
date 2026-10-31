@@ -199,7 +199,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			newAPIError = channelErr
+			newAPIError = finalRelayErrorAfterSelectionFailure(channelErr, relayInfo, retryParam)
 			break
 		}
 		addUsedChannel(c, channel.Id)
@@ -240,7 +240,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-		
+
 		if shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			keyIndex := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
 			retryParam.AddExcludeKey(channel.Id, keyIndex)
@@ -332,6 +332,16 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return nil, newAPIError
 	}
 	return channel, nil
+}
+
+func finalRelayErrorAfterSelectionFailure(channelErr *types.NewAPIError, info *relaycommon.RelayInfo, retryParam *service.RetryParam) *types.NewAPIError {
+	if channelErr == nil || channelErr.GetErrorCode() != types.ErrorCodeGetChannelFailed {
+		return channelErr
+	}
+	if info == nil || info.LastError == nil || retryParam == nil || !retryParam.SelectionExhausted || len(retryParam.ExcludeKeys) == 0 {
+		return channelErr
+	}
+	return info.LastError
 }
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
@@ -528,7 +538,6 @@ func RelayTask(c *gin.Context) {
 		ExcludeKeys: make(map[string]bool),
 	}
 	common.SetContextKey(c, constant.ContextKeyFailedChannelKeys, retryParam.ExcludeKeys)
-
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		var channel *model.Channel

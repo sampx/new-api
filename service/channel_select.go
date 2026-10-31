@@ -12,13 +12,14 @@ import (
 )
 
 type RetryParam struct {
-	Ctx          *gin.Context
-	TokenGroup   string
-	ModelName    string
-	RequestPath  string
-	Retry        *int
-	resetNextTry bool
-	ExcludeKeys  map[string]bool // keys to exclude from selection: "<channel_id>_<key_index>"
+	Ctx                *gin.Context
+	TokenGroup         string
+	ModelName          string
+	RequestPath        string
+	Retry              *int
+	resetNextTry       bool
+	ExcludeKeys        map[string]bool // keys to exclude from selection: "<channel_id>_<key_index>"
+	SelectionExhausted bool            // true when the latest selection found no eligible channel/key candidates
 }
 
 func (p *RetryParam) AddExcludeKey(channelId, keyIndex int) {
@@ -94,6 +95,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	var err error
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
+	param.SelectionExhausted = false
 
 	if param.TokenGroup == "auto" {
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
@@ -112,10 +114,14 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 		}
 
+		allGroupsExhausted := true
 		for i := startGroupIndex; i < len(autoGroups); i++ {
 			autoGroup := autoGroups[i]
 			var isExhausted bool
 			channel, isExhausted, _ = model.GetRandomSatisfiedChannel(autoGroup, param.ModelName, param.RequestPath, param.ExcludeKeys)
+			if !isExhausted {
+				allGroupsExhausted = false
+			}
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -128,6 +134,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 				param.SetRetry(0)
 				continue
 			}
+			allGroupsExhausted = false
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, autoGroup)
 			selectGroup = autoGroup
 			logger.LogDebug(param.Ctx, "Auto selected group: %s", autoGroup)
@@ -152,8 +159,13 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 			break
 		}
+		if channel == nil && allGroupsExhausted {
+			param.SelectionExhausted = true
+		}
 	} else {
-		channel, _, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.RequestPath, param.ExcludeKeys)
+		var isExhausted bool
+		channel, isExhausted, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.RequestPath, param.ExcludeKeys)
+		param.SelectionExhausted = channel == nil && isExhausted
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}

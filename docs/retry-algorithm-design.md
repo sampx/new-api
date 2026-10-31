@@ -2,7 +2,7 @@
 
 ## 1. 背景与现状问题
 
-在现有的 `new-api` 架构中，当请求外部 AI 渠道返回 429 (Rate Limit / Quota Exceeded) 等错误时，系统会触发重试 (`RetryTimes`)。
+在现有的 `new-api` 架构中，当请求外部 AI 渠道返回 429 (Rate Limit / Quota Exceeded) 等命中自动重试状态码规则的错误时，系统会在 `RetryTimes` 配置的重试预算内触发重试。
 但当前的降级与重试算法存在以下缺陷：
 
 1. **重试次数（RetryIndex）与渠道优先级（Priority）硬绑定**：
@@ -22,6 +22,8 @@
 改造后，系统应呈现如下行为：
 - **穷尽同级资源**：如果 Priority 8 中有 3 个 Key（无论是在 1 个多 Key 渠道里，还是拆分成 3 个单 Key 渠道），当出现 429 时，剩余的重试次数应优先消耗在这剩下的 2 个未尝试的 Key/渠道上。
 - **平滑降级**：只有当 Priority 8 的所有候选者都被本次请求证实不可用（均在本次黑名单中），才去获取 Priority 7 的渠道。
+- **尊重重试预算**：每次真实失败后继续排除当前 channel/key，并在 `RetryTimes` 配置的剩余预算内按既有优先级与权重选择下一个候选；候选先耗尽则提前停止，重试预算先耗尽也停止。未命中自动重试状态码规则的错误立即停止。
+- **保留真实失败原因**：如果已经实际请求过 upstream，之后因本请求的排除集合导致候选耗尽，最终客户端错误保留最后一个真实 upstream error；如果首次选路就没有候选、从未请求 upstream，则仍返回原有的渠道选择失败错误。
 - **保护全局状态**：不使用持久化的 AutoBan 来处理 429，只在当前 `gin.Context` 级别维护一个“本请求生命周期内的黑名单”（排斥名单）。
 - **完全兼容现有计费**：不修改任何计费逻辑（保持 `preConsume` / `Settle` 安全），不改变 GORM 数据库结构。
 
@@ -76,4 +78,5 @@ targetPriority := sortedUniquePriorities[retry] // 直接按 retry 取对应的 
 
 - **不重构外部包**：只修改 `model/channel_cache.go` (选择算法)、`service/channel_select.go` (封装) 和 `controller/relay.go` (失败写入)。
 - **隔离性**：新增的上下文黑名单仅在 `for` 重试循环内有效，请求结束即销毁。
+- **终态错误与选择逻辑分离**：selector 继续按既有优先级、权重、多 Key 和 auto-group 规则工作，只向 controller 暴露“本次选择已耗尽候选”的状态；controller 据此决定是否恢复最后一个真实 upstream error，不用 generic exhaustion 覆盖它。
 - **实施准则**：严格遵守 Golang 风格，无过深嵌套，并在提交代码前跑通相关测试用例。
