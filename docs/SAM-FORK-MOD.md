@@ -52,7 +52,7 @@
 
 ## 2. 当前 Sam 定制提交总览
 
-截至业务修复提交 `1ec1c707e`，`sam-dev` 相对 `origin/main` 包含以下 10 个需要在未来上游升级时识别的定制/治理提交：
+截至提交 `2a2308b25`，`sam-dev` 相对 `origin/main` 包含以下 11 个需要在未来上游升级时识别的定制/治理提交：
 
 | 编号 | 变更主题 | 提交哈希 | 涉及模块 | 主要功能 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -66,6 +66,7 @@
 | **08** | 终态 retry 错误汇总与日志追踪 | `d18e0d500` | `controller`, `docs` | 最终重试失败时汇总各渠道 upstream 错误，客户端消息硬限制 400 Unicode 字符；成功响应不携带历史错误，服务端记录清晰 retry trace |
 | **09** | OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 | `d0bd59d7f` | `relaykit/relayconvert` | Gemini 渠道补齐标准推理档位映射，档位不再被静默丢弃 |
 | **10** | Gemini 3 工具链转换对齐、分片重组与零输出拦截 | `1ec1c707e` | `relaykit`, `relay/channel/gemini` | 透传 `functionCall.id`/`thoughtSignature`，接入有状态 `partialArgs` 流转换器与零输出报错 |
+| **11** | TX 部署脚本支持 `--restart` / `--debug` 与分支门禁 | `2a2308b25` | 根目录脚本 | 默认只加载镜像不自动重启；传入 `--restart` 自动调用远程 `start.sh` 并健康检查 |
 
 ---
 
@@ -233,6 +234,16 @@
   5. 延迟流式首帧下发直至看到可见输出、思考或工具调用；流式与非流式均拦截纯签名零输出和 `MALFORMED_FUNCTION_CALL` 等异常零输出并转为 `502` `ErrorCodeEmptyResponse`，同时兼容上游无 `finishReason` 的正常 EOF 工具流。
 - **维护注意**：
   - 未来升级上游时，`partialArgs` 与 `FunctionCall.ID` 基础设施可由上游替代，但 `extra_content.google.thought_signature` 双向保真、直连渠道接线与零输出拦截需核对上游是否已补齐。
+
+---
+
+### 11. TX 部署脚本支持 `--restart` / `--debug` 与分支门禁 (`2a2308b25`)
+
+- **涉及文件**：[`deploy_to_tx.sh`](../deploy_to_tx.sh)
+- **主要功能**：
+  1. 构建前校验当前分支必须为 `sam-dev`，并在退出时自动清理本地 `new-api-local.tar`；
+  2. 默认模式仅构建、上传并加载镜像到 TX（防止依赖该网关的会话在途中自断）；
+  3. 传入 `--restart` 时自动在 TX 执行 `/home/sam/apps/new-api/start.sh` 重建容器，并轮询 `http://127.0.0.1:3000/api/status` 确认就绪；支持叠加 `--debug` 透传给远程启动脚本。
 
 ---
 
