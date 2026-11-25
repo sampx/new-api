@@ -52,7 +52,7 @@
 
 ## 2. 当前 Sam 定制提交总览
 
-截至业务修复提交 `d18e0d500`（及其后的第 09 号修复），`sam-dev` 相对 `origin/main` 包含以下 9 个需要在未来上游升级时识别的定制/治理提交：
+截至业务修复提交 `7d5234a22`，`sam-dev` 相对 `origin/main` 包含以下 9 个需要在未来上游升级时识别的定制/治理提交：
 
 | 编号 | 变更主题 | 提交哈希 | 涉及模块 | 主要功能 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -64,7 +64,7 @@
 | **06** | `sam-dev` 分支与生产部署治理规则 | `3cf6eeb85` | `docs` | 明确 `main` / `sam-dev` / `upstream/main` 职责、生产构建来源与受控上游升级流程 |
 | **07** | Retry exhaustion 错误保真 | `247c8a27a` | `controller`, `service`, `docs` | 保留 `RetryTimes` 与既有选路机制；候选耗尽时向客户端返回最后真实 upstream error，而不是 generic `get_channel_failed` |
 | **08** | 终态 retry 错误汇总与日志追踪 | `d18e0d500` | `controller`, `docs` | 最终重试失败时汇总各渠道 upstream 错误，客户端消息硬限制 400 Unicode 字符；成功响应不携带历史错误，服务端记录清晰 retry trace |
-| **09** | OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 | `<本次提交>` | `relaykit/relayconvert` | Gemini 渠道补齐标准推理档位映射，档位不再被静默丢弃 |
+| **09** | OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 | `7d5234a22` | `relaykit/relayconvert` | Gemini 渠道补齐标准推理档位映射，档位不再被静默丢弃 |
 
 ---
 
@@ -190,7 +190,7 @@
 
 ---
 
-### 09. OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 (`<本次提交>`)
+### 09. OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 (`7d5234a22`)
 
 - **涉及文件**：
   - `relaykit/relayconvert/internal/shared/gemini/request.go`
