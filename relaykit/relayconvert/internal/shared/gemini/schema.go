@@ -56,6 +56,7 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 		}
 
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		sanitizeGeminiEnum(cleanedMap)
 
 		if props, ok := cleanedMap["properties"].(map[string]interface{}); ok && props != nil {
 			cleanedProps := make(map[string]interface{})
@@ -102,6 +103,7 @@ func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
 			}
 		}
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		sanitizeGeminiEnum(cleanedMap)
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
 		delete(cleanedMap, "anyOf")
@@ -110,6 +112,27 @@ func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
 		return []interface{}{}
 	default:
 		return params
+	}
+}
+
+// sanitizeGeminiEnum keeps the enum constraint only when every element is a
+// string, the only form Gemini's legacy Schema accepts. Any other shape is
+// dropped while preserving the declared type.
+func sanitizeGeminiEnum(schema map[string]interface{}) {
+	raw, exists := schema["enum"]
+	if !exists {
+		return
+	}
+	values, ok := raw.([]interface{})
+	if !ok {
+		delete(schema, "enum")
+		return
+	}
+	for _, value := range values {
+		if _, isString := value.(string); !isString {
+			delete(schema, "enum")
+			return
+		}
 	}
 }
 

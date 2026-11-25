@@ -270,6 +270,13 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 				Name:     name,
 				Response: contentMap,
 			}
+			if message.ToolCallId != "" {
+				idBytes, err := kitutil.Marshal(message.ToolCallId)
+				if err != nil {
+					return nil, fmt.Errorf("failed to marshal function response ID: %w", err)
+				}
+				functionResp.ID = idBytes
+			}
 
 			*parts = append(*parts, dto.GeminiPart{
 				FunctionResponse: functionResp,
@@ -293,9 +300,15 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 				}
 				toolCall := dto.GeminiPart{
 					FunctionCall: &dto.FunctionCall{
+						ID:           call.ID,
 						FunctionName: call.Function.Name,
 						Arguments:    args,
 					},
+				}
+				if call.ExtraContent != nil && call.ExtraContent.Google != nil {
+					if sharedgemini.SetThoughtSignature(&toolCall, call.ExtraContent.Google.ThoughtSignature) {
+						signatureAttached = true
+					}
 				}
 				if shouldAttachThoughtSignature && !signatureAttached && sharedgemini.AttachFunctionCallThoughtSignature(opts, &toolCall) {
 					signatureAttached = true

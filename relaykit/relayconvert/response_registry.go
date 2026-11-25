@@ -988,7 +988,10 @@ func convertGeminiChatStreamResponseChunkToOAIChat(_ context.Context, info convm
 	if info != nil && info.HasChannelMeta() {
 		model = info.GetUpstreamModelName()
 	}
-	responses := streamState.ConvertChunk(geminiResponse, model, usage)
+	responses, err := streamState.ConvertChunk(geminiResponse, model, usage)
+	if err != nil {
+		return nil, nil, err
+	}
 	return streamValuesFromAny(responses), usage, nil
 }
 
@@ -1001,7 +1004,10 @@ func finalizeGeminiChatStreamResponseToOAIChat(_ context.Context, info convmeta.
 	if info != nil && info.HasChannelMeta() {
 		model = info.GetUpstreamModelName()
 	}
-	responses := streamState.Finalize(model)
+	responses, err := streamState.Finalize(model)
+	if err != nil {
+		return nil, nil, err
+	}
 	return streamValuesFromAny(responses), streamState.Usage(), nil
 }
 

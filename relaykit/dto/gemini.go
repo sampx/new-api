@@ -239,8 +239,21 @@ func (g *GeminiInlineData) UnmarshalJSON(data []byte) error {
 }
 
 type FunctionCall struct {
-	FunctionName string `json:"name"`
-	Arguments    any    `json:"args"`
+	// ID is optional in the Gemini protocol and identifies the matching function response.
+	ID           string             `json:"id,omitempty"`
+	FunctionName string             `json:"name"`
+	Arguments    any                `json:"args"`
+	PartialArgs  []GeminiPartialArg `json:"partialArgs,omitempty"`
+	WillContinue *bool              `json:"willContinue,omitempty"`
+}
+
+type GeminiPartialArg struct {
+	JSONPath     string          `json:"jsonPath"`
+	NumberValue  *float64        `json:"numberValue,omitempty"`
+	StringValue  *string         `json:"stringValue,omitempty"`
+	BoolValue    *bool           `json:"boolValue,omitempty"`
+	NullValue    json.RawMessage `json:"nullValue,omitempty"`
+	WillContinue *bool           `json:"willContinue,omitempty"`
 }
 
 type GeminiFunctionResponse struct {

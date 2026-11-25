@@ -121,10 +121,11 @@ func (c *ChatCompletionsStreamResponseChoiceDelta) SetReasoningContent(s string)
 
 type ToolCallResponse struct {
 	// Index is not nil only in chat completion chunk object
-	Index    *int             `json:"index,omitempty"`
-	ID       string           `json:"id,omitempty"`
-	Type     any              `json:"type"`
-	Function FunctionResponse `json:"function"`
+	Index        *int                  `json:"index,omitempty"`
+	ID           string                `json:"id,omitempty"`
+	Type         any                   `json:"type"`
+	Function     FunctionResponse      `json:"function"`
+	ExtraContent *ToolCallExtraContent `json:"extra_content,omitempty"`
 }
 
 func (c *ToolCallResponse) SetIndex(i int) {
@@ -179,6 +180,7 @@ func (c *ChatCompletionsStreamResponse) ClearToolCalls() {
 			c.Choices[choiceIdx].Delta.ToolCalls[callIdx].ID = ""
 			c.Choices[choiceIdx].Delta.ToolCalls[callIdx].Type = nil
 			c.Choices[choiceIdx].Delta.ToolCalls[callIdx].Function.Name = ""
+			c.Choices[choiceIdx].Delta.ToolCalls[callIdx].ExtraContent = nil
 		}
 	}
 }

@@ -50,6 +50,17 @@ func GeminiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 		)
 	}
 
+	summary := relayconvert.InspectGeminiOutput(&geminiResponse)
+	if (!summary.HasVisibleOutput && relayconvert.IsAbnormalZeroOutputFinish(summary.FinishReason)) || (!summary.HasVisibleOutput && !summary.HasThoughtOutput) {
+		usage := buildUsageFromGeminiResponse(c, info, &geminiResponse)
+		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_output")
+		return &usage, types.NewOpenAIError(
+			errors.New("empty visible output from Gemini API"),
+			types.ErrorCodeEmptyResponse,
+			http.StatusBadGateway,
+		)
+	}
+
 	chatResp := responseGeminiChat2OpenAI(c, &geminiResponse)
 	chatResp.Model = info.UpstreamModelName
 	if responseID := helper.GetResponseID(c); responseID != "" {
@@ -90,9 +101,7 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
-	finishReason := constant.FinishReasonStop
-	toolCallIndexByChoice := make(map[int]map[string]int)
-	nextToolCallIndexByChoice := make(map[int]int)
+	geminiState := relayconvert.NewGeminiToChatStreamState(responseID, created)
 	var streamErr *types.NewAPIError
 
 	sendEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
@@ -124,50 +133,38 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 	}
 
 	usage, streamAPIError := geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
-		response, isStop := streamResponseGeminiChat2OpenAI(geminiResponse)
-		response.Id = responseID
-		response.Created = created
-		response.Model = info.UpstreamModelName
-
-		if response.IsToolCall() {
-			finishReason = constant.FinishReasonToolCalls
-		}
-		for choiceIdx := range response.Choices {
-			choiceKey := response.Choices[choiceIdx].Index
-			for toolIdx := range response.Choices[choiceIdx].Delta.ToolCalls {
-				tool := &response.Choices[choiceIdx].Delta.ToolCalls[toolIdx]
-				if tool.ID == "" {
-					continue
-				}
-				indexByID := toolCallIndexByChoice[choiceKey]
-				if indexByID == nil {
-					indexByID = make(map[string]int)
-					toolCallIndexByChoice[choiceKey] = indexByID
-				}
-				if idx, ok := indexByID[tool.ID]; ok {
-					tool.SetIndex(idx)
-					continue
-				}
-				idx := nextToolCallIndexByChoice[choiceKey]
-				nextToolCallIndexByChoice[choiceKey] = idx + 1
-				indexByID[tool.ID] = idx
-				tool.SetIndex(idx)
-			}
-		}
-
-		if !sendChunk(response) {
+		chunks, convErr := geminiState.ConvertChunk(geminiResponse, info.UpstreamModelName, nil)
+		if convErr != nil {
+			streamErr = types.NewOpenAIError(convErr, types.ErrorCodeEmptyResponse, http.StatusBadGateway)
 			return false
 		}
-		if isStop {
-			return sendChunk(helper.GenerateStopResponse(responseID, created, info.UpstreamModelName, finishReason))
+		for _, chunk := range chunks {
+			if !sendChunk(chunk) {
+				return false
+			}
 		}
 		return true
 	})
+	if streamErr != nil {
+		clearEventStreamHeadersIfUnwritten(c)
+		return nil, streamErr
+	}
 	if streamAPIError != nil {
+		clearEventStreamHeadersIfUnwritten(c)
 		return usage, streamAPIError
 	}
-	if streamErr != nil {
-		return nil, streamErr
+
+	finalGeminiChunks, finalGeminiErr := geminiState.Finalize(info.UpstreamModelName)
+	if finalGeminiErr != nil {
+		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_stream")
+		clearEventStreamHeadersIfUnwritten(c)
+		return usage, types.NewOpenAIError(finalGeminiErr, types.ErrorCodeEmptyResponse, http.StatusBadGateway)
+	}
+	for _, chunk := range finalGeminiChunks {
+		if !sendChunk(chunk) {
+			clearEventStreamHeadersIfUnwritten(c)
+			return nil, streamErr
+		}
 	}
 
 	if usage != nil {

@@ -131,7 +131,9 @@ func OpenAIResponsesRequestToGeminiChat(c context.Context, req *dto.OpenAIRespon
 			if err != nil {
 				return nil, err
 			}
-			sharedgemini.AttachFunctionCallThoughtSignature(opts, &part)
+			if !lastModelTurnHasFunctionCallSignature(geminiRequest.Contents) {
+				sharedgemini.AttachFunctionCallThoughtSignature(opts, &part)
+			}
 			if callID != "" {
 				callNames[callID] = part.FunctionCall.FunctionName
 			}
@@ -252,6 +254,7 @@ func responsesFunctionCallItemToGeminiPart(item map[string]any) (dto.GeminiPart,
 	callID := CallID(item)
 	return dto.GeminiPart{
 		FunctionCall: &dto.FunctionCall{
+			ID:           callID,
 			FunctionName: name,
 			Arguments:    ObjectValue(item["arguments"], "arguments"),
 		},
@@ -264,12 +267,34 @@ func responsesFunctionOutputItemToGeminiPart(item map[string]any, callNames map[
 	if name == "" {
 		name = callNames[callID]
 	}
-	return dto.GeminiPart{
-		FunctionResponse: &dto.GeminiFunctionResponse{
-			Name:     name,
-			Response: GeminiResponseMap(item["output"]),
-		},
+	functionResp := &dto.GeminiFunctionResponse{
+		Name:     name,
+		Response: GeminiResponseMap(item["output"]),
 	}
+	if callID != "" {
+		if idBytes, err := kitutil.Marshal(callID); err == nil {
+			functionResp.ID = idBytes
+		}
+	}
+	return dto.GeminiPart{
+		FunctionResponse: functionResp,
+	}
+}
+
+func lastModelTurnHasFunctionCallSignature(contents []dto.GeminiChatContent) bool {
+	if len(contents) == 0 {
+		return false
+	}
+	last := contents[len(contents)-1]
+	if last.Role != "model" {
+		return false
+	}
+	for _, part := range last.Parts {
+		if part.FunctionCall != nil && len(part.ThoughtSignature) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func appendGeminiContentPart(req *dto.GeminiChatRequest, role string, part dto.GeminiPart) {

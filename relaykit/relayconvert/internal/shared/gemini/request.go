@@ -39,7 +39,42 @@ var SafetySettingCategories = []string{
 	"HARM_CATEGORY_DANGEROUS_CONTENT",
 }
 
-const ThoughtSignatureBypassValue = "context_engineering_is_the_way_to_go"
+const (
+	ThoughtSignatureBypassValue   = "context_engineering_is_the_way_to_go"
+	ThoughtSignatureSkipValidator = "skip_thought_signature_validator"
+)
+
+func IsThoughtSignatureBypass(sig string) bool {
+	switch strings.TrimSpace(sig) {
+	case ThoughtSignatureBypassValue, ThoughtSignatureSkipValidator:
+		return true
+	default:
+		return false
+	}
+}
+
+func ThoughtSignatureValue(part dto.GeminiPart) string {
+	if len(part.ThoughtSignature) == 0 {
+		return ""
+	}
+	var sig string
+	if err := kitutil.Unmarshal(part.ThoughtSignature, &sig); err == nil {
+		return strings.TrimSpace(sig)
+	}
+	return strings.TrimSpace(string(part.ThoughtSignature))
+}
+
+func SetThoughtSignature(part *dto.GeminiPart, sig string) bool {
+	if part == nil {
+		return false
+	}
+	sig = strings.TrimSpace(sig)
+	if sig == "" {
+		return false
+	}
+	part.ThoughtSignature = []byte(strconv.Quote(sig))
+	return true
+}
 
 const (
 	pro25MinBudget       = 128

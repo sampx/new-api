@@ -71,9 +71,28 @@ func geminiResponseUsageText(response *dto.GeminiChatResponse) string {
 			if part.Text != "" {
 				text.WriteString(part.Text)
 			}
+			if part.FunctionCall != nil {
+				text.WriteString(part.FunctionCall.FunctionName)
+				if args, err := common.Marshal(part.FunctionCall.Arguments); err == nil {
+					text.Write(args)
+				}
+			}
 		}
 	}
 	return text.String()
+}
+
+func clearEventStreamHeadersIfUnwritten(c *gin.Context) {
+	if c == nil || c.Writer == nil || c.Writer.Written() {
+		return
+	}
+	h := c.Writer.Header()
+	h.Del("Content-Type")
+	h.Del("Cache-Control")
+	h.Del("Connection")
+	h.Del("Transfer-Encoding")
+	h.Del("X-Accel-Buffering")
+	c.Set("event_stream_headers_set", false)
 }
 
 func markGeminiGoogleSearchCall(c *gin.Context, response *dto.GeminiChatResponse) {
@@ -148,32 +167,34 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	var usage = &dto.Usage{}
 	var imageCount int
 	var hasBillableUsageMetadata bool
+	var streamErr error
+	var promptBlockReason string
 	responseText := strings.Builder{}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var geminiResponse dto.GeminiChatResponse
 		if err := common.UnmarshalJsonStr(data, &geminiResponse); err != nil {
-			sr.Stop(fmt.Errorf("unmarshal: %w", err))
+			streamErr = fmt.Errorf("unmarshal Gemini stream response: %w", err)
+			sr.Stop(streamErr)
 			return
 		}
 
 		if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
-			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
+			promptBlockReason = *geminiResponse.PromptFeedback.BlockReason
+			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", promptBlockReason))
 		}
 
 		markGeminiGoogleSearchCall(c, &geminiResponse)
 
-		// 统计图片数量
+		// 统计图片数量与输出文本
 		for _, candidate := range geminiResponse.Candidates {
 			for _, part := range candidate.Content.Parts {
 				if part.InlineData != nil && part.InlineData.MimeType != "" {
 					imageCount++
 				}
-				if part.Text != "" {
-					responseText.WriteString(part.Text)
-				}
 			}
 		}
+		responseText.WriteString(geminiResponseUsageText(&geminiResponse))
 
 		// 更新使用量统计
 		if metadata := geminiResponse.GetUsageMetadata(); dto.HasGeminiUsageMetadataTokens(metadata) {
@@ -183,7 +204,12 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 
 		if !callback(data, &geminiResponse) {
-			sr.Stop(fmt.Errorf("gemini callback stopped"))
+			if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+				sr.Stop(nil)
+				return
+			}
+			streamErr = errors.New("gemini callback stopped")
+			sr.Stop(streamErr)
 		}
 	})
 
@@ -203,6 +229,19 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		patchGeminiZeroCompletionUsage(c, info, usage, responseText.String(), imageCount)
 	}
 
+	if promptBlockReason != "" && info.SendResponseCount == 0 {
+		clearEventStreamHeadersIfUnwritten(c)
+		return usage, types.NewOpenAIError(
+			errors.New("request blocked by Gemini API: "+promptBlockReason),
+			types.ErrorCodePromptBlocked,
+			http.StatusBadRequest,
+		)
+	}
+	if streamErr != nil {
+		clearEventStreamHeadersIfUnwritten(c)
+		return usage, types.NewOpenAIError(streamErr, types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+	}
+
 	return usage, nil
 }
 
@@ -210,92 +249,83 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	id := helper.GetResponseID(c)
 	createAt := common.GetTimestamp()
 	finishReason := constant.FinishReasonStop
-	toolCallIndexByChoice := make(map[int]map[string]int)
-	nextToolCallIndexByChoice := make(map[int]int)
+	state := relayconvert.NewGeminiToChatStreamState(id, createAt)
+	var convStreamErr error
 
 	usage, err := geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
-		response, isStop := streamResponseGeminiChat2OpenAI(geminiResponse)
-
-		response.Id = id
-		response.Created = createAt
-		response.Model = info.UpstreamModelName
-		if response.IsToolCall() {
-			finishReason = constant.FinishReasonToolCalls
+		chunks, convErr := state.ConvertChunk(geminiResponse, info.UpstreamModelName, nil)
+		if convErr != nil {
+			convStreamErr = convErr
+			return false
+		}
+		for _, response := range chunks {
+			if response.IsToolCall() {
+				finishReason = constant.FinishReasonToolCalls
+			}
 			if info.RelayFormat == types.RelayFormatClaude {
 				for choiceIdx := range response.Choices {
 					response.Choices[choiceIdx].FinishReason = nil
 				}
 			}
-		}
-		for choiceIdx := range response.Choices {
-			choiceKey := response.Choices[choiceIdx].Index
-			for toolIdx := range response.Choices[choiceIdx].Delta.ToolCalls {
-				tool := &response.Choices[choiceIdx].Delta.ToolCalls[toolIdx]
-				if tool.ID == "" {
-					continue
-				}
-				m := toolCallIndexByChoice[choiceKey]
-				if m == nil {
-					m = make(map[string]int)
-					toolCallIndexByChoice[choiceKey] = m
-				}
-				if idx, ok := m[tool.ID]; ok {
-					tool.SetIndex(idx)
-					continue
-				}
-				idx := nextToolCallIndexByChoice[choiceKey]
-				nextToolCallIndexByChoice[choiceKey] = idx + 1
-				m[tool.ID] = idx
-				tool.SetIndex(idx)
-			}
-		}
 
-		logger.LogDebug(c, "info.SendResponseCount = %d", info.SendResponseCount)
-		if info.SendResponseCount == 0 {
-			// send first response
-			emptyResponse := helper.GenerateStartEmptyResponse(id, createAt, info.UpstreamModelName, nil)
-			if response.IsToolCall() {
-				if len(emptyResponse.Choices) > 0 && len(response.Choices) > 0 {
-					toolCalls := response.Choices[0].Delta.ToolCalls
-					copiedToolCalls := make([]dto.ToolCallResponse, len(toolCalls))
-					for idx := range toolCalls {
-						copiedToolCalls[idx] = toolCalls[idx]
-						copiedToolCalls[idx].Function.Arguments = ""
+			logger.LogDebug(c, "info.SendResponseCount = %d", info.SendResponseCount)
+			if info.SendResponseCount == 0 {
+				// Delay the opening assistant chunk until real output or tool calls arrive.
+				emptyResponse := helper.GenerateStartEmptyResponse(id, createAt, info.UpstreamModelName, nil)
+				if response.IsToolCall() {
+					if len(emptyResponse.Choices) > 0 && len(response.Choices) > 0 {
+						toolCalls := response.Choices[0].Delta.ToolCalls
+						copiedToolCalls := make([]dto.ToolCallResponse, len(toolCalls))
+						for idx := range toolCalls {
+							copiedToolCalls[idx] = toolCalls[idx]
+							copiedToolCalls[idx].Function.Arguments = ""
+						}
+						emptyResponse.Choices[0].Delta.ToolCalls = copiedToolCalls
 					}
-					emptyResponse.Choices[0].Delta.ToolCalls = copiedToolCalls
-				}
-				finishReason = constant.FinishReasonToolCalls
-				err := handleStream(c, info, emptyResponse)
-				if err != nil {
-					logger.LogError(c, err.Error())
-				}
-
-				response.ClearToolCalls()
-				if response.IsFinished() {
-					response.Choices[0].FinishReason = nil
-				}
-			} else {
-				err := handleStream(c, info, emptyResponse)
-				if err != nil {
-					logger.LogError(c, err.Error())
+					finishReason = constant.FinishReasonToolCalls
+					if streamErr := handleStream(c, info, emptyResponse); streamErr != nil {
+						logger.LogError(c, streamErr.Error())
+					}
+					response.ClearToolCalls()
+				} else {
+					if streamErr := handleStream(c, info, emptyResponse); streamErr != nil {
+						logger.LogError(c, streamErr.Error())
+					}
 				}
 			}
-		}
 
-		err := handleStream(c, info, response)
-		if err != nil {
-			logger.LogError(c, err.Error())
-		}
-		if isStop {
-			if info.RelayFormat != types.RelayFormatClaude {
-				_ = handleStream(c, info, helper.GenerateStopResponse(id, createAt, info.UpstreamModelName, finishReason))
+			if streamErr := handleStream(c, info, response); streamErr != nil {
+				logger.LogError(c, streamErr.Error())
 			}
 		}
 		return true
 	})
 
+	if convStreamErr != nil {
+		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_stream")
+		clearEventStreamHeadersIfUnwritten(c)
+		return usage, types.NewOpenAIError(convStreamErr, types.ErrorCodeEmptyResponse, http.StatusBadGateway)
+	}
 	if err != nil {
+		clearEventStreamHeadersIfUnwritten(c)
 		return usage, err
+	}
+
+	finalChunks, finalErr := state.Finalize(info.UpstreamModelName)
+	if finalErr != nil {
+		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_stream")
+		clearEventStreamHeadersIfUnwritten(c)
+		return usage, types.NewOpenAIError(finalErr, types.ErrorCodeEmptyResponse, http.StatusBadGateway)
+	}
+	for _, finalChunk := range finalChunks {
+		if len(finalChunk.Choices) > 0 && finalChunk.Choices[0].FinishReason != nil {
+			finishReason = *finalChunk.Choices[0].FinishReason
+		}
+		if info.RelayFormat != types.RelayFormatClaude {
+			if streamErr := handleStream(c, info, finalChunk); streamErr != nil {
+				logger.LogError(c, streamErr.Error())
+			}
+		}
 	}
 
 	response := helper.GenerateFinalUsageResponse(id, createAt, info.UpstreamModelName, *usage)
@@ -357,6 +387,16 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			})
 		}
 		return &usage, nil
+	}
+	summary := relayconvert.InspectGeminiOutput(&geminiResponse)
+	if (!summary.HasVisibleOutput && relayconvert.IsAbnormalZeroOutputFinish(summary.FinishReason)) || (!summary.HasVisibleOutput && !summary.HasThoughtOutput) {
+		usage := buildUsageFromGeminiResponse(c, info, &geminiResponse)
+		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_output")
+		return &usage, types.NewOpenAIError(
+			errors.New("empty visible output from Gemini API"),
+			types.ErrorCodeEmptyResponse,
+			http.StatusBadGateway,
+		)
 	}
 	fullTextResponse := responseGeminiChat2OpenAI(c, &geminiResponse)
 	fullTextResponse.Model = info.UpstreamModelName

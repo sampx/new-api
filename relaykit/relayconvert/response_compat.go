@@ -11,6 +11,8 @@ import (
 
 type ClaudeResponseInfo = claudemessages.ClaudeResponseInfo
 
+type GeminiToChatStreamState = geminichat.GeminiToChatStreamState
+type GeminiOutputSummary = geminichat.GeminiOutputSummary
 type ChatToResponsesStreamEvent = oaichat.ChatToResponsesStreamEvent
 type ChatToResponsesStreamState = oaichat.ChatToResponsesStreamState
 type ResponsesToChatStreamState = oairesponses.ResponsesToChatStreamState
@@ -78,6 +80,18 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 
 func StreamResponseGeminiChat2OpenAI(geminiResponse *dto.GeminiChatResponse) (*dto.ChatCompletionsStreamResponse, bool) {
 	return geminichat.StreamResponseGeminiChat2OpenAI(geminiResponse)
+}
+
+func NewGeminiToChatStreamState(id string, created int64) *GeminiToChatStreamState {
+	return geminichat.NewGeminiToChatStreamState(id, created)
+}
+
+func InspectGeminiOutput(response *dto.GeminiChatResponse) GeminiOutputSummary {
+	return geminichat.InspectGeminiOutput(response)
+}
+
+func IsAbnormalZeroOutputFinish(reason string) bool {
+	return geminichat.IsAbnormalZeroOutputFinish(reason)
 }
 
 func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id string) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
