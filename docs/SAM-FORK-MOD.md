@@ -52,7 +52,7 @@
 
 ## 2. 当前 Sam 定制提交总览
 
-截至业务修复提交 `7d5234a22`，`sam-dev` 相对 `origin/main` 包含以下 9 个需要在未来上游升级时识别的定制/治理提交：
+截至业务修复提交 `d0bd59d7f`，`sam-dev` 相对 `origin/main` 包含以下 9 个需要在未来上游升级时识别的定制/治理提交：
 
 | 编号 | 变更主题 | 提交哈希 | 涉及模块 | 主要功能 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -64,7 +64,7 @@
 | **06** | `sam-dev` 分支与生产部署治理规则 | `3cf6eeb85` | `docs` | 明确 `main` / `sam-dev` / `upstream/main` 职责、生产构建来源与受控上游升级流程 |
 | **07** | Retry exhaustion 错误保真 | `247c8a27a` | `controller`, `service`, `docs` | 保留 `RetryTimes` 与既有选路机制；候选耗尽时向客户端返回最后真实 upstream error，而不是 generic `get_channel_failed` |
 | **08** | 终态 retry 错误汇总与日志追踪 | `d18e0d500` | `controller`, `docs` | 最终重试失败时汇总各渠道 upstream 错误，客户端消息硬限制 400 Unicode 字符；成功响应不携带历史错误，服务端记录清晰 retry trace |
-| **09** | OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 | `7d5234a22` | `relaykit/relayconvert` | Gemini 渠道补齐标准推理档位映射，档位不再被静默丢弃 |
+| **09** | OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 | `d0bd59d7f` | `relaykit/relayconvert` | Gemini 渠道补齐标准推理档位映射，档位不再被静默丢弃 |
 
 ---
 
@@ -190,7 +190,7 @@
 
 ---
 
-### 09. OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 (`7d5234a22`)
+### 09. OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 (`d0bd59d7f`)
 
 - **涉及文件**：
   - `relaykit/relayconvert/internal/shared/gemini/request.go`
@@ -200,11 +200,12 @@
   - 结果是所有请求都按模型默认（通常是最低档）思考，客户端声明的推理档位完全失效；
   - 上游 `upstream/main` 已用全新的 reasoning intent 系统支持该映射，但按受控升级流程不在本次同步范围。
 - **主要实现**：
-  1. 在 `ApplyThinkingConfig` 的模型名后缀分支之后新增兜底分支：请求带非空 `reasoning_effort` 且 `thinkingConfig` 尚未生成时执行映射；
-  2. 映射规则（对齐 Gemini 官方 `thinkingLevel` 枚举）：`minimal/low/medium/high/xhigh` 原样；`max` → `xhigh`；`none` → `thinkingBudget: 0`（关闭思考）；
-  3. 优先级保持不变：`extra_body.google.thinking_config`（provider-native lossless 配置）与模型名 effort 后缀仍优先于该标准字段映射；
-  4. 生效后调用 `info.SetReasoningEffort` 记录有效档位，供日志观测；
-  5. 覆盖 Chat Completions 与 Responses 两条入口（两处均经 `ApplyThinkingConfig`）。
+  1. 标准 OpenAI `reasoning_effort` → Gemini `thinkingConfig` 的映射不受 `thinking_adapter_enabled` 开关约束：该开关只负责 new-api 私有的模型名后缀约定（`-thinking` / `-nothinking` / `-high`…），而 `reasoning_effort` 是 Chat Completions 协议字段，必须始终生效；
+  2. 按模型方言分流：Gemini 2.x 及更早走 `thinkingBudget`（沿用本仓既有的档位→预算换算，`none` 关闭思考并对不支持关闭的模型 clamp 到最小预算），Gemini 3.x 起走 `thinkingLevel`（`minimal/low/medium/high/xhigh` 原样，`max` → `xhigh`，`none` 不下发强度交由上游默认）；
+  3. 模型版本无法识别时不猜方言、不下发强度，避免猜错字段被上游 400；
+  4. 优先级：`extra_body.google.thinking_config`（provider-native lossless 配置）与模型名 effort 后缀仍优先于该标准字段映射，已有 `thinkingConfig` 不被覆盖；
+  5. 生效后调用 `info.SetReasoningEffort` 记录有效档位，供日志观测；
+  6. 覆盖 Chat Completions 与 Responses 两条入口（两处均经 `ApplyThinkingConfig`）。
 - **维护注意**：
   - 未知 effort 值原样透传给上游报错（与 `extra_body` 路径行为一致），不在网关层新增 4xx 拦截；
   - 未来升级到上游 reasoning intent 系统时，本定制可整体由 `reasoning.FromOpenAIChat` + `geminiLevelForEffort` 替代，归档为「已被上游替代」。
