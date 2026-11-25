@@ -52,7 +52,7 @@
 
 ## 2. 当前 Sam 定制提交总览
 
-截至业务修复提交 `d0bd59d7f`，`sam-dev` 相对 `origin/main` 包含以下 9 个需要在未来上游升级时识别的定制/治理提交：
+截至业务修复提交 `1ec1c707e`，`sam-dev` 相对 `origin/main` 包含以下 10 个需要在未来上游升级时识别的定制/治理提交：
 
 | 编号 | 变更主题 | 提交哈希 | 涉及模块 | 主要功能 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -65,6 +65,7 @@
 | **07** | Retry exhaustion 错误保真 | `247c8a27a` | `controller`, `service`, `docs` | 保留 `RetryTimes` 与既有选路机制；候选耗尽时向客户端返回最后真实 upstream error，而不是 generic `get_channel_failed` |
 | **08** | 终态 retry 错误汇总与日志追踪 | `d18e0d500` | `controller`, `docs` | 最终重试失败时汇总各渠道 upstream 错误，客户端消息硬限制 400 Unicode 字符；成功响应不携带历史错误，服务端记录清晰 retry trace |
 | **09** | OpenAI `reasoning_effort` → Gemini `thinkingLevel` 转换 | `d0bd59d7f` | `relaykit/relayconvert` | Gemini 渠道补齐标准推理档位映射，档位不再被静默丢弃 |
+| **10** | Gemini 3 工具链转换对齐、分片重组与零输出拦截 | `1ec1c707e` | `relaykit`, `relay/channel/gemini` | 透传 `functionCall.id`/`thoughtSignature`，接入有状态 `partialArgs` 流转换器与零输出报错 |
 
 ---
 
@@ -209,6 +210,29 @@
 - **维护注意**：
   - 未知 effort 值原样透传给上游报错（与 `extra_body` 路径行为一致），不在网关层新增 4xx 拦截；
   - 未来升级到上游 reasoning intent 系统时，本定制可整体由 `reasoning.FromOpenAIChat` + `geminiLevelForEffort` 替代，归档为「已被上游替代」。
+
+---
+
+### 10. Gemini 3 工具链转换对齐、分片重组与零输出拦截 (`1ec1c707e`)
+
+- **涉及文件**：
+  - `relaykit/dto/gemini.go`、`relaykit/dto/openai_request.go`、`relaykit/dto/openai_response.go`
+  - `relaykit/relayconvert/internal/shared/gemini/request.go`、`schema.go`
+  - `relaykit/relayconvert/internal/oai_chat/to_gemini_chat_req.go`、`internal/oai_responses/to_gemini_chat_req.go`
+  - `relaykit/relayconvert/internal/gemini_chat/to_oai_chat_resp.go`、`response_compat.go`、`response_registry.go`
+  - `relay/channel/gemini/relay-gemini.go`、`relay_responses.go`
+  - `relaykit/relayconvert/gemini_protocol_test.go`、`relay/channel/gemini/relay_gemini_stream_test.go`
+- **背景与问题**：
+  - 基线未支持 Gemini 3 `FunctionCall.ID`、`partialArgs`/`willContinue`，响应随机生成 `call_<uuid>` 且丢弃 `thoughtSignature`，仅给首个工具调用挂固定 bypass，Responses 入口还对并行工具全部挂 bypass；
+  - 即使 `upstream/main` 的 `relay/channel/gemini` 也未把 `GeminiToChatStreamState` 接入直连 Chat/Responses 渠道处理器，且遇到纯 `thoughtSignature` 空壳或 `MALFORMED_FUNCTION_CALL` 零输出时会直接返回 HTTP 200 空消息。
+- **主要实现**：
+  1. DTO 补齐 `FunctionCall.ID` / `PartialArgs` / `WillContinue` 与 `ToolCallExtraContent.Google.ThoughtSignature`（`extra_content.google.thought_signature`）；
+  2. Chat Completions 与 Responses 请求侧均透传 `functionCall.id` 和 `functionResponse.id`，保留已有真实签名不被 bypass 覆盖，且缺失签名时仅对每轮首个 `functionCall` 挂 bypass；
+  3. 同步上游非字符串 `enum` 清洗（保留声明 `type`）及逐字文本拼接修复；
+  4. `GeminiToChatStreamState` 移植 `partialArgs` 重组、跨帧稳定 tool index、跳过纯签名空 delta，并在 `GeminiChatStreamHandler` / `GeminiResponsesStreamHandler` 正式启用；
+  5. 延迟流式首帧下发直至看到可见输出、思考或工具调用；流式与非流式均拦截纯签名零输出和 `MALFORMED_FUNCTION_CALL` 等异常零输出并转为 `502` `ErrorCodeEmptyResponse`，同时兼容上游无 `finishReason` 的正常 EOF 工具流。
+- **维护注意**：
+  - 未来升级上游时，`partialArgs` 与 `FunctionCall.ID` 基础设施可由上游替代，但 `extra_content.google.thought_signature` 双向保真、直连渠道接线与零输出拦截需核对上游是否已补齐。
 
 ---
 
