@@ -144,7 +144,38 @@ func ApplyThinkingConfig(geminiRequest *dto.GeminiChatRequest, info convmeta.Met
 			ThinkingLevel:   level,
 		}
 		info.SetReasoningEffort(level)
+	} else if effort := reasoningEffortOf(oaiRequest); effort != "" && geminiRequest.GenerationConfig.ThinkingConfig == nil {
+		// Standard OpenAI `reasoning_effort` → Gemini thinkingLevel. Runs only
+		// when no model-name suffix fired and the caller has not already set a
+		// provider-native thinkingConfig (extra_body.google.thinking_config is
+		// the lossless representation and keeps priority). `none` disables
+		// thinking via a zero budget; `max` has no Gemini equivalent so it maps
+		// to the highest level (xhigh).
+		if effort == "none" {
+			geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
+				ThinkingBudget: kitutil.GetPointer(0),
+			}
+		} else {
+			level := effort
+			if level == "max" {
+				level = "xhigh"
+			}
+			geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
+				IncludeThoughts: true,
+				ThinkingLevel:   level,
+			}
+			info.SetReasoningEffort(level)
+		}
 	}
+}
+
+// reasoningEffortOf returns the request's standard OpenAI reasoning effort,
+// lowercased and trimmed. Empty when absent.
+func reasoningEffortOf(oaiRequest []dto.GeneralOpenAIRequest) string {
+	if len(oaiRequest) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(oaiRequest[0].ReasoningEffort))
 }
 
 func ParseStopSequences(stop any) []string {
