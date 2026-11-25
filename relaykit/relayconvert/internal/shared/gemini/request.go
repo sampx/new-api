@@ -83,7 +83,14 @@ func AttachFirstTextThoughtSignature(opts *convmeta.Options, parts []dto.GeminiP
 
 func ApplyThinkingConfig(geminiRequest *dto.GeminiChatRequest, info convmeta.Meta, oaiRequest ...dto.GeneralOpenAIRequest) {
 	opts := convmeta.OptionsOf(info)
-	if geminiRequest == nil || info == nil || !opts.Gemini.ThinkingAdapterEnabled {
+	if geminiRequest == nil || info == nil {
+		return
+	}
+	if !opts.Gemini.ThinkingAdapterEnabled {
+		// 思考适配器只管 new-api 自己的模型名后缀约定（-thinking / -nothinking /
+		// -high…）。标准 OpenAI reasoning_effort 是协议字段，必须始终生效，
+		// 不能被这个私有开关挡住。
+		applyReasoningEffortConfig(geminiRequest, info, oaiRequest...)
 		return
 	}
 
@@ -144,38 +151,81 @@ func ApplyThinkingConfig(geminiRequest *dto.GeminiChatRequest, info convmeta.Met
 			ThinkingLevel:   level,
 		}
 		info.SetReasoningEffort(level)
-	} else if effort := reasoningEffortOf(oaiRequest); effort != "" && geminiRequest.GenerationConfig.ThinkingConfig == nil {
-		// Standard OpenAI `reasoning_effort` → Gemini thinkingLevel. Runs only
-		// when no model-name suffix fired and the caller has not already set a
-		// provider-native thinkingConfig (extra_body.google.thinking_config is
-		// the lossless representation and keeps priority). `none` disables
-		// thinking via a zero budget; `max` has no Gemini equivalent so it maps
-		// to the highest level (xhigh).
-		if effort == "none" {
-			geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
-				ThinkingBudget: kitutil.GetPointer(0),
-			}
-		} else {
-			level := effort
-			if level == "max" {
-				level = "xhigh"
-			}
-			geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
-				IncludeThoughts: true,
-				ThinkingLevel:   level,
-			}
-			info.SetReasoningEffort(level)
-		}
+	} else {
+		applyReasoningEffortConfig(geminiRequest, info, oaiRequest...)
 	}
 }
 
-// reasoningEffortOf returns the request's standard OpenAI reasoning effort,
-// lowercased and trimmed. Empty when absent.
-func reasoningEffortOf(oaiRequest []dto.GeneralOpenAIRequest) string {
-	if len(oaiRequest) == 0 {
-		return ""
+// geminiThinkingDialect 区分 Gemini 的两种思考控制方言：2.x 及更早用
+// thinkingBudget，3.x 起改用 thinkingLevel。混用会被上游以 400 拒绝。
+type geminiThinkingDialect int
+
+const (
+	geminiThinkingDialectUnknown geminiThinkingDialect = iota
+	geminiThinkingDialectBudget
+	geminiThinkingDialectLevel
+)
+
+func geminiThinkingDialectOf(modelName string) geminiThinkingDialect {
+	version, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(modelName)), "gemini-")
+	if !ok {
+		return geminiThinkingDialectUnknown
 	}
-	return strings.ToLower(strings.TrimSpace(oaiRequest[0].ReasoningEffort))
+	version = strings.TrimPrefix(version, "v")
+	// 取版本号前导数字：同时覆盖 "2.5-pro"、"3.8-flash"、"4-hydrogen" 三种写法。
+	majorRaw := version
+	if i := strings.IndexFunc(version, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+		majorRaw = version[:i]
+	}
+	major, err := strconv.Atoi(majorRaw)
+	if err != nil {
+		return geminiThinkingDialectUnknown
+	}
+	if major >= 3 {
+		return geminiThinkingDialectLevel
+	}
+	return geminiThinkingDialectBudget
+}
+
+// applyReasoningEffortConfig 把标准 OpenAI reasoning_effort 落成 Gemini
+// thinkingConfig。调用方已写入的 thinkingConfig（extra_body.google.thinking_config
+// 是 lossless 表示）优先，不覆盖；模型版本方言未知时不猜强度。
+func applyReasoningEffortConfig(geminiRequest *dto.GeminiChatRequest, info convmeta.Meta, oaiRequest ...dto.GeneralOpenAIRequest) {
+	if geminiRequest.GenerationConfig.ThinkingConfig != nil || len(oaiRequest) == 0 {
+		return
+	}
+	effort := strings.ToLower(strings.TrimSpace(oaiRequest[0].ReasoningEffort))
+	if effort == "" {
+		return
+	}
+	modelName := convmeta.UpstreamModelName(info)
+	switch geminiThinkingDialectOf(modelName) {
+	case geminiThinkingDialectBudget:
+		// thinkingBudget 方言：沿用本仓既有的档位→预算换算；none 表示关闭
+		// 思考，clamp 会把不支持关闭的模型抬到各自的最小预算。
+		budget := clampThinkingBudgetByEffort(modelName, effort)
+		if effort == "none" {
+			budget = clampThinkingBudget(modelName, 0)
+		}
+		geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
+			ThinkingBudget: kitutil.GetPointer(budget),
+		}
+		info.SetReasoningEffort(effort)
+	case geminiThinkingDialectLevel:
+		// thinkingLevel 方言无法关闭思考，none 不下发强度，交由上游默认。
+		if effort == "none" {
+			return
+		}
+		// Gemini 官方枚举是 minimal/low/medium/high；xhigh 为 Gemini 4
+		// Hydrogen 及以上支持；max 没有对应枚举，归到最高档 xhigh。
+		if effort == "max" {
+			effort = "xhigh"
+		}
+		geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
+			ThinkingLevel: effort,
+		}
+		info.SetReasoningEffort(effort)
+	}
 }
 
 func ParseStopSequences(stop any) []string {

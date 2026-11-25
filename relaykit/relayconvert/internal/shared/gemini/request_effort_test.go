@@ -10,63 +10,107 @@ import (
 )
 
 // ApplyThinkingConfig must translate the standard OpenAI Chat
-// `reasoning_effort` field into Gemini `generationConfig.thinkingConfig`
-// when the request reaches a Gemini channel without any explicit
-// provider-native thinking_config. Without this mapping the effort is
-// silently dropped and every request falls back to the model's lowest
-// thinking tier.
+// `reasoning_effort` field into Gemini `generationConfig.thinkingConfig`.
+// Without this mapping the effort is silently dropped and every request falls
+// back to the model's default thinking tier.
 func TestOpenAIReasoningEffortToGeminiThinkingLevel(t *testing.T) {
-	validLevels := map[string]struct {
-		effort string
-		level  string
-		budget *int
-	}{
-		"minimal": {effort: "minimal", level: "minimal"},
-		"low":     {effort: "low", level: "low"},
-		"medium":  {effort: "medium", level: "medium"},
-		"high":    {effort: "high", level: "high"},
-		"xhigh":   {effort: "xhigh", level: "xhigh"},
-		"max":     {effort: "max", level: "xhigh"},
-		"none":    {effort: "none", level: "", budget: ptr(0)},
+	levelModels := map[string]string{
+		"minimal": "minimal",
+		"low":     "low",
+		"medium":  "medium",
+		"high":    "high",
+		"xhigh":   "xhigh",
+		"max":     "xhigh",
 	}
 
-	for name, tc := range validLevels {
-		t.Run(name, func(t *testing.T) {
+	for effort, wantLevel := range levelModels {
+		t.Run("thinkingLevel dialect/"+effort, func(t *testing.T) {
 			geminiRequest := &dto.GeminiChatRequest{}
-			ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-test"), dto.GeneralOpenAIRequest{
-				Model:           "gemini-test",
-				ReasoningEffort: tc.effort,
+			ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-v4-hydrogen"), dto.GeneralOpenAIRequest{
+				Model:           "gemini-v4-hydrogen",
+				ReasoningEffort: effort,
 			})
-			require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig, "thinkingConfig must be set for effort %q", tc.effort)
-			assert.Equal(t, tc.level, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingLevel)
-			if tc.budget != nil {
-				require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
-				assert.Equal(t, *tc.budget, *geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
-			} else {
-				assert.Nil(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
-			}
+			require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig, "thinkingConfig must be set for effort %q", effort)
+			assert.Equal(t, wantLevel, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingLevel)
+			assert.Nil(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget,
+				"thinkingLevel dialect must never send thinkingBudget")
 		})
 	}
 
+	t.Run("thinkingLevel dialect/none cannot disable thinking", func(t *testing.T) {
+		geminiRequest := &dto.GeminiChatRequest{}
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-v4-hydrogen"), dto.GeneralOpenAIRequest{
+			Model:           "gemini-v4-hydrogen",
+			ReasoningEffort: "none",
+		})
+		assert.Nil(t, geminiRequest.GenerationConfig.ThinkingConfig,
+			"thinkingLevel models have no way to disable thinking; sending either field would 400")
+	})
+
+	t.Run("thinkingBudget dialect/effort becomes budget", func(t *testing.T) {
+		geminiRequest := &dto.GeminiChatRequest{}
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-2.5-flash"), dto.GeneralOpenAIRequest{
+			Model:           "gemini-2.5-flash",
+			ReasoningEffort: "high",
+		})
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig)
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
+		assert.Equal(t, 24576*80/100, *geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
+		assert.Empty(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingLevel,
+			"thinkingBudget dialect must never send thinkingLevel")
+	})
+
+	t.Run("thinkingBudget dialect/none disables thinking", func(t *testing.T) {
+		geminiRequest := &dto.GeminiChatRequest{}
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-2.5-flash"), dto.GeneralOpenAIRequest{
+			Model:           "gemini-2.5-flash",
+			ReasoningEffort: "none",
+		})
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig)
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
+		assert.Equal(t, 0, *geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
+	})
+
+	t.Run("thinkingBudget dialect/none respects model minimum budget", func(t *testing.T) {
+		geminiRequest := &dto.GeminiChatRequest{}
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-2.5-pro"), dto.GeneralOpenAIRequest{
+			Model:           "gemini-2.5-pro",
+			ReasoningEffort: "none",
+		})
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig)
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget)
+		assert.Equal(t, 128, *geminiRequest.GenerationConfig.ThinkingConfig.ThinkingBudget,
+			"gemini-2.5-pro cannot disable thinking and clamps to its 128-token minimum")
+	})
+
+	t.Run("unknown model version does not guess a dialect", func(t *testing.T) {
+		geminiRequest := &dto.GeminiChatRequest{}
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("my-gemini-alias"), dto.GeneralOpenAIRequest{
+			Model:           "my-gemini-alias",
+			ReasoningEffort: "high",
+		})
+		assert.Nil(t, geminiRequest.GenerationConfig.ThinkingConfig,
+			"without a known Gemini version the dialect is unknown; sending either field could 400")
+	})
+
 	t.Run("no effort keeps thinkingConfig empty", func(t *testing.T) {
 		geminiRequest := &dto.GeminiChatRequest{}
-		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-test"), dto.GeneralOpenAIRequest{
-			Model: "gemini-test",
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-v4-hydrogen"), dto.GeneralOpenAIRequest{
+			Model: "gemini-v4-hydrogen",
 		})
 		assert.Nil(t, geminiRequest.GenerationConfig.ThinkingConfig)
 	})
 
 	t.Run("existing thinkingConfig from extra_body wins over reasoning_effort", func(t *testing.T) {
-		// The caller (to_gemini_chat_req.go) already wrote the extra_body
-		// thinking_config before invoking the adapter; that explicit
+		// The caller already wrote the extra_body thinking_config; that explicit
 		// provider-native setting must not be overwritten.
 		geminiRequest := &dto.GeminiChatRequest{}
 		geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{
 			ThinkingLevel:   "high",
 			IncludeThoughts: true,
 		}
-		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-test"), dto.GeneralOpenAIRequest{
-			Model:           "gemini-test",
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-v4-hydrogen"), dto.GeneralOpenAIRequest{
+			Model:           "gemini-v4-hydrogen",
 			ReasoningEffort: "low",
 		})
 		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig)
@@ -74,32 +118,38 @@ func TestOpenAIReasoningEffortToGeminiThinkingLevel(t *testing.T) {
 	})
 
 	t.Run("effort suffix on model name wins over reasoning_effort", func(t *testing.T) {
-		// -high etc. suffixes only reach the converter when
-		// ThinkingAdapterEnabled strips them in GetRequestURL; a model name
-		// that carries one encodes the level directly, so the request effort
-		// must not override it.
+		// -high etc. suffixes only reach the converter when the thinking adapter
+		// is enabled (it strips the suffix in GetRequestURL); a model name that
+		// carries one encodes the level directly.
 		geminiRequest := &dto.GeminiChatRequest{}
-		ApplyThinkingConfig(geminiRequest, reasoningEffortMeta("gemini-test-high"), dto.GeneralOpenAIRequest{
-			Model:           "gemini-test-high",
+		ApplyThinkingConfig(geminiRequest, reasoningEffortMetaWithAdapter("gemini-v4-hydrogen-high", true), dto.GeneralOpenAIRequest{
+			Model:           "gemini-v4-hydrogen-high",
 			ReasoningEffort: "low",
 		})
 		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig)
 		assert.Equal(t, "high", geminiRequest.GenerationConfig.ThinkingConfig.ThinkingLevel)
 	})
 
-	t.Run("adapter disabled keeps thinkingConfig empty", func(t *testing.T) {
+	t.Run("adapter flag does not gate the standard field", func(t *testing.T) {
+		// ThinkingAdapterEnabled only governs new-api's own suffix conventions.
+		// A standard Chat Completions reasoning_effort must map regardless.
 		geminiRequest := &dto.GeminiChatRequest{}
-		ApplyThinkingConfig(geminiRequest, &convmeta.Values{}, dto.GeneralOpenAIRequest{
-			Model:           "gemini-test",
+		ApplyThinkingConfig(geminiRequest, &convmeta.Values{
+			UpstreamModelName:   "gemini-v4-hydrogen",
+			ChannelMetaAttached: true,
+			Options:             &convmeta.Options{},
+		}, dto.GeneralOpenAIRequest{
+			Model:           "gemini-v4-hydrogen",
 			ReasoningEffort: "high",
 		})
-		assert.Nil(t, geminiRequest.GenerationConfig.ThinkingConfig)
+		require.NotNil(t, geminiRequest.GenerationConfig.ThinkingConfig)
+		assert.Equal(t, "high", geminiRequest.GenerationConfig.ThinkingConfig.ThinkingLevel)
 	})
 
 	t.Run("meta records effective effort", func(t *testing.T) {
-		meta := reasoningEffortMeta("gemini-test")
+		meta := reasoningEffortMeta("gemini-v4-hydrogen")
 		ApplyThinkingConfig(&dto.GeminiChatRequest{}, meta, dto.GeneralOpenAIRequest{
-			Model:           "gemini-test",
+			Model:           "gemini-v4-hydrogen",
 			ReasoningEffort: "high",
 		})
 		assert.Equal(t, "high", meta.GetReasoningEffort())
@@ -107,15 +157,17 @@ func TestOpenAIReasoningEffortToGeminiThinkingLevel(t *testing.T) {
 }
 
 func reasoningEffortMeta(model string) *convmeta.Values {
+	return reasoningEffortMetaWithAdapter(model, false)
+}
+
+func reasoningEffortMetaWithAdapter(model string, adapter bool) *convmeta.Values {
 	return &convmeta.Values{
 		UpstreamModelName:   model,
 		ChannelMetaAttached: true,
 		Options: &convmeta.Options{
 			Gemini: convmeta.GeminiOptions{
-				ThinkingAdapterEnabled: true,
+				ThinkingAdapterEnabled: adapter,
 			},
 		},
 	}
 }
-
-func ptr[T any](v T) *T { return &v }
